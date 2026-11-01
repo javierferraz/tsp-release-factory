@@ -48,9 +48,32 @@ if (Get-UninstallEntry) { Fail 'Maquina limpia' "ya habia una instalacion con Ap
 
 # 1. Instalar en silencio. [Run] postinstall lleva skipifsilent: no arranca la app.
 $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
-$p = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=`"$log`"" -Wait -PassThru
+$p = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=`"$log`"" -PassThru
+$null = $p.Handle   # sin esto, ExitCode sale vacio al no usar -Wait
+# Mientras instala: el setup extrae y ejecuta un .tmp en %TEMP%\is-*.tmp\. Sin firma, Smart App
+# Control lo bloquea con el error 4551 (S-573); SignTool=stromboli en el .iss lo evita.
+$tmpSig = $null
+while (-not $p.HasExited) {
+    if (-not $tmpSig) {
+        $tmp = Get-ChildItem -Path $env:TEMP -Filter 'is-*.tmp' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.tmp' -File -ErrorAction SilentlyContinue } |
+            Select-Object -First 1
+        if ($tmp) {
+            try { $tmpSig = Get-AuthenticodeSignature -FilePath $tmp.FullName } catch { $tmpSig = $null }
+        }
+    }
+    Start-Sleep -Milliseconds 100
+}
+$p.WaitForExit()
 if ($p.ExitCode -ne 0) { Fail 'Instalar (/VERYSILENT)' "codigo de salida $($p.ExitCode); log en $log" }
 Add-Row 'Instalar (/VERYSILENT)' 'codigo de salida 0'
+if (-not $tmpSig) {
+    Add-Row 'Firma del .tmp interno (aviso)' 'no se llego a ver el .tmp mientras instalaba; sin comprobar'
+} elseif ($tmpSig.Status -ne 'Valid') {
+    Fail 'Firma del .tmp interno' "$($tmpSig.Status): el setup ejecuta un .tmp sin firma valida (error 4551 con Smart App Control, S-573)"
+} else {
+    Add-Row 'Firma del .tmp interno' "valida; firmante $($tmpSig.SignerCertificate.Subject -replace '^CN=([^,]+).*', '$1')"
+}
 
 $installDir = $null
 $exe = $null
