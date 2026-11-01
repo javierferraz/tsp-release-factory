@@ -21,7 +21,11 @@ Qué hace, en `windows-latest`:
 
 1. Comprueba que el token ve el repo de la app y que la Release `<tag>` no tiene ya los ficheros
    (si los tiene, falla antes de construir: **no pisa nada**).
-2. Saca el repo de la app en el tag y comprueba que `tauri.conf.json` y `package.json` llevan
+2. Saca el repo de la app en el tag **con saltos de línea LF** (`core.autocrlf false`; los
+   runners de Windows traen `true` y sacarían CRLF). Así se construye igual que en el portátil
+   y en Linux, y no rompe tests que leen su propio fuente: el `v1.0.0` de Bright Cardinal busca
+   `"\n}\n"` en `include_str!("commands.rs")` y con CRLF fallaba (run 41340319888). Luego
+   comprueba que `tauri.conf.json` y `package.json` llevan
    la versión del tag.
 3. Node 22 + Rust estable, `npm ci`, `npm test` y `cargo test --lib`.
 4. `tauri build --bundles nsis` con el `signCommand` de esta fábrica (`signing/sign.cmd`,
