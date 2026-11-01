@@ -323,12 +323,14 @@ jobs:
           "| Python | CPython $got; entorno del build = requirements-build.txt exacto ($($pinned.Count) paquetes) |" >> $env:REPORT
 
       # Solo las apps de config/tests-en-windows.txt; el resto los pasa en el job de Linux. Entorno
-      # aparte para que pytest no se cuele en el binario.
-      - name: Tests (pytest, offscreen) en Windows
+      # aparte para que pytest no se cuele en el binario. Sin forzar QT_QPA_PLATFORM: el runner
+      # tiene escritorio, como el portatil, y los tests que lo necesitan ponen offscreen ellos
+      # mismos. Forzado desde el arranque, los 71 tests de Snappy Wasp v1.6.2 pasan pero el
+      # proceso muere al cerrar con 0xC0000374 (heap corruption), tambien en el portatil.
+      - name: Tests (pytest) en Windows
         if: needs.checks.outputs.tests_on == 'windows'
         working-directory: app
         env:
-          QT_QPA_PLATFORM: offscreen
           PYTEST_VERSION: 9.1.1
         run: |
           $venv = Join-Path $env:RUNNER_TEMP 'venv-test'
