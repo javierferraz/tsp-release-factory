@@ -1,0 +1,377 @@
+name: Build PySide6 (Windows)
+
+# Construye, firma y prueba el instalador de Windows de una app PySide6 de la suite
+# (PyInstaller + Inno Setup) y lo deja como prerelease en la Release <tag> del repo de la app.
+# NO publica nada: ni FTP, ni manifest, ni web (eso es R6). Las apps PySide6 no llevan .sig de
+# Tauri: su actualizador confia en el manifest firmado (R6). Paquete R4 de
+# docs/distribucion/releases-automaticas.md (repo central, S-1069).
+#
+# Solo se dispara a mano (o desde el «si» de la tanda, R8): no hay entornos con aprobacion
+# en el plan gratuito, asi que la puerta humana es el propio disparo.
+#   gh workflow run build-pyside-windows.yml -R javierferraz/tsp-release-factory \
+#     -f app=snappy-wasp -f repo=javierferraz/2606-snappy-wasp -f tag=v1.6.2
+#
+# Lo que el workflow espera del repo de la app (convenciones de tsp-create-dist):
+#   - un unico *.spec en la raiz, cuyo nombre es el de dist\<Nombre>\<Nombre>.exe;
+#   - requirements-build.txt con el freeze exacto del build y la linea
+#     "Interprete: CPython X.Y.Z" (PyInstaller congela el interprete que lo ejecuta);
+#   - __version__ = "X.Y.Z" en utils/version.py (o version.py, o main.py);
+#   - "## [X.Y.Z]" sellado en CHANGELOG.md;
+#   - un unico .iss en packaging/windows/ o packaging/, con SignTool=stromboli,
+#     PrivilegesRequired=lowest y la version del tag.
+
+run-name: Windows ${{ inputs.app }} ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Slug de la app (p. ej. snappy-wasp)
+        required: true
+        type: string
+      repo:
+        description: Repo de la app (p. ej. javierferraz/2606-snappy-wasp)
+        required: true
+        type: string
+      tag:
+        description: Tag a construir, vX.Y.Z (admite sufijo de pruebas, p. ej. v1.6.2-factory-test)
+        required: true
+        type: string
+
+# El GITHUB_TOKEN solo lee esta fabrica. Todo lo del repo de la app va con APPS_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-pyside-windows-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Doble cerrojo: solo workflow_dispatch y solo con el workflow de main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Las entradas se usan siempre por variable de entorno, nunca interpoladas en el script.
+      APP: ${{ inputs.app }}
+      APP_REPO: ${{ inputs.repo }}
+      TAG: ${{ inputs.tag }}
+      # Cliente de Azure Trusted Signing, fijado por version y por hash.
+      TS_CLIENT_VERSION: 1.0.95
+      TS_CLIENT_SHA256: 3BFCF1E0A3CB42AF1692F0A8ED45C15DE070C2DE86F28A59B2795D904D8A920F
+      # Inno Setup, la misma version que en el portatil; fijado por hash (digest de la Release
+      # de jrsoftware/issrc, comprobado contra la descarga) y por firmante.
+      INNO_VERSION: 6.7.3
+      INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe
+      INNO_SHA256: 9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732
+      # pytest no esta en requirements-build.txt (no entra en el binario): se fija aqui.
+      PYTEST_VERSION: 9.1.1
+    steps:
+      - name: Validar entradas
+        id: meta
+        run: |
+          if ($env:APP -notmatch '^[a-z0-9]+(-[a-z0-9]+)*$') { throw "app no valido: '$env:APP'" }
+          if ($env:APP_REPO -notmatch '^javierferraz/[A-Za-z0-9._-]+$') { throw "repo no valido: '$env:APP_REPO'" }
+          if (-not ($env:TAG -match '^v(\d+\.\d+\.\d+)(-[0-9A-Za-z.-]+)?$')) { throw "tag no valido: '$env:TAG' (se espera vX.Y.Z o vX.Y.Z-sufijo)" }
+          $version = $Matches[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "asset=$env:APP-v$version-windows-x64-setup.exe" >> $env:GITHUB_OUTPUT
+          $env:REPORT = Join-Path $env:RUNNER_TEMP 'report.md'
+          $env:OUT = Join-Path $env:RUNNER_TEMP 'out'
+          "REPORT=$env:REPORT" >> $env:GITHUB_ENV
+          "OUT=$env:OUT" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force $env:OUT | Out-Null
+          @(
+            "## $env:APP $env:TAG (Windows, PySide6)", '',
+            "Repo ``$env:APP_REPO``, version X.Y.Z ``$version``.", '',
+            '| Comprobacion | Resultado |', '|---|---|'
+          ) | Set-Content -Path $env:REPORT -Encoding utf8
+
+      # Antes de gastar el build: el token ve el repo y la Release no tiene ya estos ficheros
+      # (no se pisan nunca).
+      - name: Acceso al repo de la app y Release sin esos ficheros
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          gh api "repos/$env:APP_REPO" --jq .full_name *> $null
+          if ($LASTEXITCODE -ne 0) { throw "APPS_TOKEN no puede leer $env:APP_REPO (token vacio, caducado o sin ese repo)" }
+          $names = gh api "repos/$env:APP_REPO/releases/tags/$env:TAG" --jq '.assets[].name' 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $clash = @($names | Where-Object { $_ -in @($env:ASSET, 'SHA256SUMS.txt') })
+            if ($clash.Count) { throw "La Release $env:TAG ya tiene: $($clash -join ', '). No se pisan; borralos a mano si hay que rehacerlos." }
+            "| Release $env:TAG | ya existe, sin ficheros de Windows |" >> $env:REPORT
+          } else {
+            "| Release $env:TAG | no existe; se creara como prerelease |" >> $env:REPORT
+          }
+          # El 404 de una Release que no existe no es un fallo del paso.
+          $global:LASTEXITCODE = 0
+
+      # Igual que en Tauri: los runners traen core.autocrlf=true; se construye con LF, como el
+      # resto de la fabrica.
+      - name: Saltos de linea LF en el checkout
+        run: git config --global core.autocrlf false
+
+      - name: Checkout de la fabrica
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: factory
+          persist-credentials: false
+
+      - name: Checkout de la app en el tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repo }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.APPS_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - name: El tag coincide con la version, el CHANGELOG y el .iss
+        id: conf
+        working-directory: app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          # Version de la app
+          $vfile = @('utils/version.py', 'version.py', 'main.py') | Where-Object {
+            (Test-Path $_) -and ((Get-Content $_ -Raw) -match '(?m)^__version__\s*=\s*"([^"]+)"')
+          } | Select-Object -First 1
+          if (-not $vfile) { throw 'No hay __version__ = "X.Y.Z" en utils/version.py, version.py ni main.py' }
+          $null = (Get-Content $vfile -Raw) -match '(?m)^__version__\s*=\s*"([^"]+)"'
+          if ($Matches[1] -ne $env:VERSION) { throw "$vfile dice '$($Matches[1])' y el tag $env:TAG pide '$env:VERSION'" }
+
+          # CHANGELOG sellado
+          $esc = [regex]::Escape($env:VERSION)
+          if (-not ((Get-Content CHANGELOG.md -Raw) -match "(?m)^## \[$esc\]")) { throw "CHANGELOG.md no tiene la seccion sellada '## [$env:VERSION]'" }
+
+          # .spec
+          $specs = @(Get-ChildItem -File -Filter '*.spec')
+          if ($specs.Count -ne 1) { throw "Se esperaba 1 .spec en la raiz y hay $($specs.Count)" }
+          $name = $specs[0].BaseName
+
+          # Python del build: el que dice requirements-build.txt
+          if (-not (Test-Path requirements-build.txt)) { throw 'Falta requirements-build.txt (freeze exacto del build)' }
+          if (-not ((Get-Content requirements-build.txt -Raw) -match 'CPython (\d+\.\d+\.\d+)')) { throw "requirements-build.txt no declara 'Interprete: CPython X.Y.Z'" }
+          $py = $Matches[1]
+
+          # .iss
+          $isses = @(Get-ChildItem -File -Path packaging/windows/*.iss, packaging/*.iss -ErrorAction SilentlyContinue)
+          if ($isses.Count -ne 1) { throw "Se esperaba 1 .iss en packaging/windows/ o packaging/ y hay $($isses.Count)" }
+          $iss = $isses[0]
+          $text = Get-Content $iss.FullName -Raw
+          $issVersion = if ($text -match '(?m)^#define\s+AppVersion\s+"([^"]+)"') { $Matches[1] } elseif ($text -match '(?m)^AppVersion=(.+?)\s*$') { $Matches[1] } else { '' }
+          if ($issVersion -ne $env:VERSION) { throw "$($iss.Name) dice AppVersion '$issVersion' y el tag pide '$env:VERSION'" }
+          if ($text -notmatch '(?m)^SignTool=stromboli\s*$') { throw "$($iss.Name) no lleva SignTool=stromboli: el .tmp interno saldria sin firmar (S-573)" }
+          if ($text -notmatch '(?m)^PrivilegesRequired=lowest\s*$') { throw "$($iss.Name) no lleva PrivilegesRequired=lowest" }
+          if ($text -notmatch '(?m)^DefaultDirName=\{localappdata\}\\') { throw "$($iss.Name) no instala en {localappdata}" }
+          if (-not ($text -match '(?m)^AppId=(.+?)\s*$')) { throw "$($iss.Name) no tiene AppId" }
+          $appId = $Matches[1].Replace('{{', '{')
+
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "spec=$($specs[0].Name)" >> $env:GITHUB_OUTPUT
+          "python=$py" >> $env:GITHUB_OUTPUT
+          "iss=$($iss.FullName)" >> $env:GITHUB_OUTPUT
+          "appid=$appId" >> $env:GITHUB_OUTPUT
+          "| Version | $vfile, CHANGELOG sellado y $($iss.Name) = $env:VERSION; commit $(git rev-parse --short HEAD) |" >> $env:REPORT
+          "| .iss | SignTool=stromboli, PrivilegesRequired=lowest, {localappdata}, AppId $appId |" >> $env:REPORT
+
+      - name: Python del build
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.conf.outputs.python }}
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            app/requirements-build.txt
+            app/requirements.txt
+
+      # Dos entornos nuevos: el del build solo con el freeze (lo que entra en el binario) y el de
+      # los tests aparte, para que pytest y sus dependencias no se cuelen en el .exe. Lecciones de
+      # la suite: un entorno equivocado metio numpy en Spider y otra cryptography en Frog.
+      - name: Entornos limpios (build y tests)
+        working-directory: app
+        env:
+          PY_WANT: ${{ steps.conf.outputs.python }}
+        run: |
+          $got = python -c 'import platform; print(platform.python_version())'
+          if ($got -ne $env:PY_WANT) { throw "setup-python dio $got y el freeze pide $env:PY_WANT" }
+          $build = Join-Path $env:RUNNER_TEMP 'venv-build'
+          $test = Join-Path $env:RUNNER_TEMP 'venv-test'
+          python -m venv $build
+          python -m venv $test
+          & "$build\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw 'pip install -r requirements-build.txt falla' }
+          # El entorno del build tiene exactamente el freeze: nada de mas, nada de menos.
+          $norm = { param($l) ($l -replace '#.*$', '').Trim().ToLower().Replace('_', '-') }
+          $pinned = @(Get-Content requirements-build.txt | ForEach-Object { & $norm $_ } | Where-Object { $_ })
+          $frozen = @(& "$build\Scripts\python.exe" -m pip freeze | ForEach-Object { & $norm $_ } | Where-Object { $_ })
+          $extra = @($frozen | Where-Object { $_ -notin $pinned })
+          $missing = @($pinned | Where-Object { $_ -notin $frozen })
+          if ($extra.Count -or $missing.Count) { throw "El entorno del build no es el freeze. De mas: $($extra -join ', '). Faltan: $($missing -join ', ')" }
+          & "$test\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements.txt "pytest==$env:PYTEST_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'pip install del entorno de tests falla' }
+          "VENV_BUILD=$build" >> $env:GITHUB_ENV
+          "VENV_TEST=$test" >> $env:GITHUB_ENV
+          "| Python | CPython $got; entorno del build = requirements-build.txt exacto ($($pinned.Count) paquetes); tests con pytest $env:PYTEST_VERSION aparte |" >> $env:REPORT
+
+      # QT_QPA_PLATFORM=offscreen: el runner no tiene pantalla; ningun test abre ventanas reales.
+      - name: Tests (pytest)
+        working-directory: app
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          & "$env:VENV_TEST\Scripts\python.exe" -m pytest -q -p no:cacheprovider -rs 2>&1 | Tee-Object -Variable lines
+          $code = $LASTEXITCODE
+          $summary = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\d+ (passed|failed|error)' }) | Select-Object -Last 1
+          if (-not $summary) { $summary = 'sin linea de resumen' }
+          $skips = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '^SKIPPED' })
+          if ($code -ne 0) { throw "pytest falla ($code): $summary" }
+          "| pytest | $($summary.Trim('= ')) |" >> $env:REPORT
+          foreach ($s in $skips) { "| pytest (saltado) | $($s -replace '\|', '/') |" >> $env:REPORT }
+
+      - name: Herramientas de firma (signtool + Azure Trusted Signing)
+        run: |
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\signtool.exe' |
+            Sort-Object { [version]($_.Directory.Parent.Name) } | Select-Object -Last 1
+          if (-not $signtool) { throw 'No hay signtool.exe del Windows SDK en el runner' }
+          $nupkg = Join-Path $env:RUNNER_TEMP 'trusted-signing-client.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $nupkg -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.trusted.signing.client/$env:TS_CLIENT_VERSION/microsoft.trusted.signing.client.$env:TS_CLIENT_VERSION.nupkg"
+          $hash = (Get-FileHash $nupkg -Algorithm SHA256).Hash
+          if ($hash -ne $env:TS_CLIENT_SHA256) { throw "El nupkg de Trusted Signing no es el esperado (SHA256 $hash)" }
+          $client = Join-Path $env:RUNNER_TEMP 'trusted-signing-client'
+          Expand-Archive -Path $nupkg -DestinationPath $client
+          $dlib = Join-Path $client 'bin\x64\Azure.CodeSigning.Dlib.dll'
+          if (-not (Test-Path $dlib)) { throw 'Falta Azure.CodeSigning.Dlib.dll en el nupkg' }
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "TS_DLIB=$dlib" >> $env:GITHUB_ENV
+          "TS_METADATA=$env:GITHUB_WORKSPACE\factory\signing\metadata.json" >> $env:GITHUB_ENV
+          "SIGN_CMD=$env:GITHUB_WORKSPACE\factory\signing\sign.cmd" >> $env:GITHUB_ENV
+          "| Firma | signtool $($signtool.Directory.Parent.Name), Trusted Signing client $env:TS_CLIENT_VERSION (hash comprobado) |" >> $env:REPORT
+
+      - name: Inno Setup
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
+          Invoke-WebRequest -UseBasicParsing -OutFile $setup -Uri $env:INNO_URL
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash
+          if ($hash -ne $env:INNO_SHA256) { throw "El instalador de Inno Setup no es el esperado (SHA256 $hash)" }
+          $sig = Get-AuthenticodeSignature $setup
+          if ($sig.Status -ne 'Valid') { throw "Firma del instalador de Inno: $($sig.Status)" }
+          $dir = Join-Path $env:RUNNER_TEMP 'inno'
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', "/DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "La instalacion de Inno Setup sale con $($p.ExitCode)" }
+          $iscc = Join-Path $dir 'ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw 'No aparece ISCC.exe' }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+          $signer = $sig.SignerCertificate.Subject -replace '^CN=([^,]+).*', '$1'
+          "| Inno Setup | $env:INNO_VERSION (hash comprobado, firmado por $signer) |" >> $env:REPORT
+
+      # PATH reducido al entorno y a Windows: PyInstaller busca las DLL por el PATH y, con el de
+      # Git delante, empaqueta su OpenSSL en lugar del de Python (le paso a la suite en Git Bash).
+      - name: PyInstaller y firma del .exe
+        working-directory: app
+        env:
+          NAME: ${{ steps.conf.outputs.name }}
+          SPEC: ${{ steps.conf.outputs.spec }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          foreach ($n in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($n))) { throw "Falta el secreto $n" }
+          }
+          $fullPath = $env:PATH
+          $env:PATH = "$env:VENV_BUILD\Scripts;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
+          & "$env:VENV_BUILD\Scripts\python.exe" -m PyInstaller --noconfirm --clean $env:SPEC
+          $code = $LASTEXITCODE
+          $env:PATH = $fullPath
+          if ($code -ne 0) { throw 'pyinstaller falla' }
+          $dist = Join-Path (Get-Location) "dist\$env:NAME"
+          $exe = Join-Path $dist "$env:NAME.exe"
+          if (-not (Test-Path $exe)) { throw "No existe dist\$env:NAME\$env:NAME.exe" }
+
+          # Nada ajeno al entorno: ni el OpenSSL de Git (libssl-3-x64) ni DLL de MSYS.
+          $foreign = @(Get-ChildItem $dist -Recurse -File | Where-Object { $_.Name -match '^(libssl-3-x64|libcrypto-3-x64|msys-.*)\.dll$' })
+          if ($foreign.Count) { throw "El bundle lleva DLL ajenas: $($foreign.Name -join ', ')" }
+          $files = @(Get-ChildItem $dist -Recurse -File)
+          $mb = [math]::Round(($files | Measure-Object Length -Sum).Sum / 1MB, 1)
+          "| PyInstaller | dist\$env:NAME\: $($files.Count) ficheros, $mb MB, sin DLL de Git/MSYS |" >> $env:REPORT
+
+          & $env:SIGN_CMD $exe
+          if ($LASTEXITCODE -ne 0) { throw "sign.cmd falla en $env:NAME.exe" }
+          & $env:SIGNTOOL verify /pa /v $exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa falla en $env:NAME.exe" }
+          "| Authenticode del .exe | $env:NAME.exe: signtool verify /pa OK |" >> $env:REPORT
+
+      # SignTool=stromboli: Inno firma con sign.cmd el desinstalador, el .tmp que el setup extrae
+      # en %TEMP% y el propio instalador (sin el .tmp firmado, Smart App Control da el error 4551,
+      # S-573). ISCC aborta si un fichero que debia firmar sale sin firma.
+      - name: Inno Setup (instalador firmado)
+        env:
+          ISS: ${{ steps.conf.outputs.iss }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          $innoOut = Join-Path $env:RUNNER_TEMP 'inno-out'
+          New-Item -ItemType Directory -Force $innoOut | Out-Null
+          # Como en el portatil (tsp-create-dist): ruta de sign.cmd sin comillas (no lleva
+          # espacios) y $f, que Inno sustituye por el fichero ya entre comillas.
+          if ($env:SIGN_CMD -match '\s') { throw "La ruta de sign.cmd lleva espacios: $env:SIGN_CMD" }
+          & $env:ISCC ("/Sstromboli=$env:SIGN_CMD " + '$f') "/O$innoOut" $env:ISS
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC falla' }
+          $found = @(Get-ChildItem $innoOut -Filter '*.exe')
+          if ($found.Count -ne 1) { throw "Se esperaba 1 instalador en la salida de ISCC y hay $($found.Count)" }
+          if ($found[0].Name -ne $env:ASSET) { "| Nombre del instalador | el .iss lo llama ``$($found[0].Name)``; se sube como ``$env:ASSET`` |" >> $env:REPORT }
+          $setup = Join-Path $env:OUT $env:ASSET
+          Copy-Item $found[0].FullName $setup
+
+          & $env:SIGNTOOL verify /pa /v $setup
+          if ($LASTEXITCODE -ne 0) { throw 'signtool verify /pa falla en el instalador' }
+          $signer = (Get-AuthenticodeSignature $setup).SignerCertificate.Subject -replace '^CN=([^,]+).*', '$1'
+          "| Authenticode del instalador | signtool verify /pa OK; firmante $signer |" >> $env:REPORT
+
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText((Join-Path $env:OUT 'SHA256SUMS.txt'), "$sha *$($env:ASSET)`n")
+          $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+          "| Instalador | ``$env:ASSET``, $mb MB, SHA256 ``$sha`` |" >> $env:REPORT
+
+      - name: Smoke del instalador en el runner
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          APP_ID: ${{ steps.conf.outputs.appid }}
+          NAME: ${{ steps.conf.outputs.name }}
+        run: |
+          & "$env:GITHUB_WORKSPACE\factory\scripts\smoke-inno.ps1" -Installer (Join-Path $env:OUT $env:ASSET) -AppId $env:APP_ID -Version $env:VERSION -ExeName "$env:NAME.exe" -SignTool $env:SIGNTOOL -Report $env:REPORT
+
+      - name: Subir a la Release del repo de la app
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          gh release view $env:TAG -R $env:APP_REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG -R $env:APP_REPO --prerelease --verify-tag --title "$env:APP $env:TAG" --notes 'Windows build from the release factory (signed installer). Not published yet.'
+            if ($LASTEXITCODE -ne 0) { throw "No se pudo crear la Release $env:TAG" }
+            $created = 'creada como prerelease'
+          } else { $created = 'ya existia' }
+          $names = gh release view $env:TAG -R $env:APP_REPO --json assets --jq '.assets[].name'
+          $clash = @($names | Where-Object { $_ -in @($env:ASSET, 'SHA256SUMS.txt') })
+          if ($clash.Count) { throw "La Release ya tiene: $($clash -join ', '). No se pisan." }
+          Push-Location $env:OUT
+          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET SHA256SUMS.txt
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw 'gh release upload falla' }
+          "| Release $env:TAG | $created; subidos ``$env:ASSET`` y ``SHA256SUMS.txt`` |" >> $env:REPORT
+
+      - name: Resumen
+        if: always()
+        run: |
+          if (Test-Path $env:REPORT) { Get-Content $env:REPORT >> $env:GITHUB_STEP_SUMMARY }
