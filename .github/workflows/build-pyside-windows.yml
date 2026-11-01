@@ -216,6 +216,11 @@ jobs:
 
       # Los tests se pasan en Linux (la mitad de coste que Windows). Los que solo tienen sentido
       # en Win32 se saltan solos con skipif y quedan listados en el resumen.
+      # -p no:unraisableexception: ese plugin de pytest fuerza gc.collect() al cerrar la sesion y
+      # destruye objetos de Qt sueltos en mal orden. Con el checkout recien sacado (sin .pyc),
+      # los 71 tests de Snappy Wasp v1.6.2 pasan y el proceso muere con 0xC0000374 (heap
+      # corruption) antes del resumen, en el runner y en el portatil; sin el plugin sale 0.
+      # Solo se pierde el aviso de excepciones "unraisable", que pytest no cuenta como fallo.
       - name: Tests (pytest, offscreen)
         if: steps.where.outputs.tests_on == 'linux'
         working-directory: app
@@ -226,7 +231,7 @@ jobs:
           python -m venv $venv
           & "$venv/bin/python" -m pip install --disable-pip-version-check --quiet -r requirements.txt "pytest==$env:PYTEST_VERSION"
           if ($LASTEXITCODE -ne 0) { throw 'pip install del entorno de tests falla' }
-          xvfb-run -a "$venv/bin/python" -m pytest -q -p no:cacheprovider -rs 2>&1 | Tee-Object -Variable lines
+          xvfb-run -a "$venv/bin/python" -m pytest -q -p no:cacheprovider -p no:unraisableexception -rs 2>&1 | Tee-Object -Variable lines
           $code = $LASTEXITCODE
           $summary = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\d+ (passed|failed|error)' }) | Select-Object -Last 1
           if (-not $summary) { $summary = 'sin linea de resumen' }
@@ -323,21 +328,20 @@ jobs:
           "| Python | CPython $got; entorno del build = requirements-build.txt exacto ($($pinned.Count) paquetes) |" >> $env:REPORT
 
       # Solo las apps de config/tests-en-windows.txt; el resto los pasa en el job de Linux. Entorno
-      # aparte para que pytest no se cuele en el binario. Sin forzar QT_QPA_PLATFORM: el runner
-      # tiene escritorio, como el portatil, y los tests que lo necesitan ponen offscreen ellos
-      # mismos. Forzado desde el arranque, los 71 tests de Snappy Wasp v1.6.2 pasan pero el
-      # proceso muere al cerrar con 0xC0000374 (heap corruption), tambien en el portatil.
-      - name: Tests (pytest) en Windows
+      # aparte para que pytest no se cuele en el binario. -p no:unraisableexception: ver el paso
+      # de tests de Linux.
+      - name: Tests (pytest, offscreen) en Windows
         if: needs.checks.outputs.tests_on == 'windows'
         working-directory: app
         env:
+          QT_QPA_PLATFORM: offscreen
           PYTEST_VERSION: 9.1.1
         run: |
           $venv = Join-Path $env:RUNNER_TEMP 'venv-test'
           python -m venv $venv
           & "$venv\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements.txt "pytest==$env:PYTEST_VERSION"
           if ($LASTEXITCODE -ne 0) { throw 'pip install del entorno de tests falla' }
-          & "$venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider -rs 2>&1 | Tee-Object -Variable lines
+          & "$venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider -p no:unraisableexception -rs 2>&1 | Tee-Object -Variable lines
           $code = $LASTEXITCODE
           $summary = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\d+ (passed|failed|error)' }) | Select-Object -Last 1
           if (-not $summary) { $summary = 'sin linea de resumen' }
