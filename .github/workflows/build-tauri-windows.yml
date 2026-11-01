@@ -95,6 +95,12 @@ jobs:
           # El 404 de una Release que no existe no es un fallo del paso.
           $global:LASTEXITCODE = 0
 
+      # Los runners de Windows traen core.autocrlf=true y sacarian el codigo en CRLF. Se
+      # construye con LF, como en el portatil y en Linux: hay tests que leen su propio fuente
+      # (include_str!) y buscan "\n}\n" (Bright Cardinal, commands.rs).
+      - name: Saltos de linea LF en el checkout
+        run: git config --global core.autocrlf false
+
       - name: Checkout de la fabrica
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
