@@ -78,6 +78,7 @@ jobs:
       python: ${{ steps.conf.outputs.python }}
       iss: ${{ steps.conf.outputs.iss }}
       appid: ${{ steps.conf.outputs.appid }}
+      tests_on: ${{ steps.where.outputs.tests_on }}
     steps:
       - name: Validar entradas
         id: meta
@@ -114,6 +115,12 @@ jobs:
           # El 404 de una Release que no existe no es un fallo del paso.
           $global:LASTEXITCODE = 0
 
+      - name: Checkout de la fabrica
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: factory
+          persist-credentials: false
+
       - name: Checkout de la app en el tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -122,6 +129,19 @@ jobs:
           token: ${{ secrets.APPS_TOKEN }}
           path: app
           persist-credentials: false
+
+      # Los tests van en Linux (la mitad de coste) salvo las apps de config/tests-en-windows.txt.
+      - name: Donde se pasan los tests
+        id: where
+        run: |
+          $entry = Get-Content factory/config/tests-en-windows.txt |
+            Where-Object { ($_ -replace '#.*$', '').Trim() -eq $env:APP } | Select-Object -First 1
+          if ($entry) {
+            "tests_on=windows" >> $env:GITHUB_OUTPUT
+            "| Tests | en Windows (config/tests-en-windows.txt: $(($entry -replace '^[^#]*#', '').Trim() -replace '\|', '/')) |" >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "tests_on=linux" >> $env:GITHUB_OUTPUT
+          }
 
       - name: El tag coincide con la version, el CHANGELOG y el .iss
         id: conf
@@ -174,6 +194,7 @@ jobs:
           "| .iss | SignTool=stromboli, PrivilegesRequired=lowest, {localappdata}, AppId $appId |" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Python de la app
+        if: steps.where.outputs.tests_on == 'linux'
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.conf.outputs.python }}
@@ -185,15 +206,18 @@ jobs:
       # Bibliotecas que Qt necesita para la plataforma offscreen en una ubuntu sin escritorio, y
       # Xvfb: pynput se conecta a un servidor X al importarse y, sin el, revienta la recogida de
       # tests (pytest 9 ya no convierte ese ImportError en un skip con importorskip).
+      # libpulse0: QtMultimedia (los sonidos de las apps) la carga al importarse.
       - name: Bibliotecas de Qt y Xvfb
+        if: steps.where.outputs.tests_on == 'linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0t64 xvfb xauth
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0t64 libpulse0 xvfb xauth
           if ($LASTEXITCODE -ne 0) { throw 'apt-get install falla' }
 
       # Los tests se pasan en Linux (la mitad de coste que Windows). Los que solo tienen sentido
       # en Win32 se saltan solos con skipif y quedan listados en el resumen.
       - name: Tests (pytest, offscreen)
+        if: steps.where.outputs.tests_on == 'linux'
         working-directory: app
         env:
           QT_QPA_PLATFORM: offscreen
@@ -273,7 +297,9 @@ jobs:
           python-version: ${{ needs.checks.outputs.python }}
           architecture: x64
           cache: pip
-          cache-dependency-path: app/requirements-build.txt
+          cache-dependency-path: |
+            app/requirements-build.txt
+            app/requirements.txt
 
       # Entorno nuevo solo con el freeze (lo que entra en el binario). Lecciones de la suite:
       # un entorno equivocado metio numpy en Spider y otra cryptography en Frog.
@@ -295,6 +321,28 @@ jobs:
           if ($extra.Count -or $missing.Count) { throw "El entorno del build no es el freeze. De mas: $($extra -join ', '). Faltan: $($missing -join ', ')" }
           "VENV_BUILD=$build" >> $env:GITHUB_ENV
           "| Python | CPython $got; entorno del build = requirements-build.txt exacto ($($pinned.Count) paquetes) |" >> $env:REPORT
+
+      # Solo las apps de config/tests-en-windows.txt; el resto los pasa en el job de Linux. Entorno
+      # aparte para que pytest no se cuele en el binario.
+      - name: Tests (pytest, offscreen) en Windows
+        if: needs.checks.outputs.tests_on == 'windows'
+        working-directory: app
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTEST_VERSION: 9.1.1
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'venv-test'
+          python -m venv $venv
+          & "$venv\Scripts\python.exe" -m pip install --disable-pip-version-check --quiet -r requirements.txt "pytest==$env:PYTEST_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'pip install del entorno de tests falla' }
+          & "$venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider -rs 2>&1 | Tee-Object -Variable lines
+          $code = $LASTEXITCODE
+          $summary = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\d+ (passed|failed|error)' }) | Select-Object -Last 1
+          if (-not $summary) { $summary = 'sin linea de resumen' }
+          $skips = @($lines | ForEach-Object { "$_" } | Where-Object { $_ -match '^SKIPPED' })
+          if ($code -ne 0) { throw "pytest falla ($code): $summary" }
+          "| pytest (windows-latest) | $($summary.Trim('= ')) |" >> $env:REPORT
+          foreach ($s in $skips) { "| pytest (saltado) | $($s -replace '\|', '/') |" >> $env:REPORT }
 
       - name: Herramientas de firma (signtool + Azure Trusted Signing)
         run: |

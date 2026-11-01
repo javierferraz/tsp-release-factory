@@ -1,0 +1,4 @@
+# Apps PySide6 cuyos tests NO se pueden pasar en Linux: build-pyside-windows.yml les pasa pytest
+# en el job de Windows (factura el doble) en lugar del de ubuntu. Una por linea: slug y motivo.
+# Sacar la app de la lista en cuanto el motivo se arregle en su repo.
+snappy-wasp  # tests/test_activity_notice.py: 2 tests usan workers.hotkey_listener._Win32Hotkey, que solo existe en Win32, sin skipif (run 41355080191)
