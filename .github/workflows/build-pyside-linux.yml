@@ -1,0 +1,264 @@
+name: Build PySide6 (Linux)
+
+# Construye el AppImage y el .deb de una app PySide6 de la suite en ubuntu-24.04 y los deja en
+# la Release <tag> del repo de la app, creandola como prerelease si no existe. NO publica nada:
+# ni FTP, ni manifest, ni web (eso es R6). Paquete R5 de docs/distribucion/releases-automaticas.md
+# (repo central, S-1069).
+#
+# Mismo build que el linux-build.yml de las 7 apps PySide6 que lo tienen (Wasp, Beaver,
+# Raccoon, Frog, Tappy, Ant, Bison): los scripts del propio repo, packaging/linux/build-appimage.sh
+# (PyInstaller onedir + AppDir + appimagetool) y build-packages.sh (fpm). Lo que pone la fabrica:
+# validacion, glibc <= 2.39, runtime del AppImage sin libfuse, SHA256 y la subida sin pisar.
+#
+# NO pasa pytest: en la tanda los pasa una sola vez el job "checks" de build-pyside-windows.yml,
+# que ya corre en Linux. Si se lanza este workflow solo, los tests no se han pasado.
+#
+# Solo se dispara a mano (o desde el «si» de la tanda, R8): no hay entornos con aprobacion
+# en el plan gratuito, asi que la puerta humana es el propio disparo.
+#   gh workflow run build-pyside-linux.yml -R javierferraz/tsp-release-factory \
+#     -f app=snappy-wasp -f repo=javierferraz/2606-snappy-wasp -f tag=v1.6.2
+#
+# Lo que el workflow espera del repo de la app (patron de tsp-linux-build §3.1):
+#   - __version__ = "X.Y.Z" en utils/version.py (es donde lo leen los scripts de Linux);
+#   - packaging/linux/build-appimage.sh y build-packages.sh, que dejan en la raiz
+#     <slug>-vX.Y.Z-linux-x64.AppImage y <slug>-vX.Y.Z-linux-x64.deb;
+#   - requirements.txt; si requirements-build.txt declara "Interprete: CPython X.Y.Z" y fija
+#     pyinstaller, se usan ese Python y esa PyInstaller (los mismos que en Windows).
+
+run-name: Linux ${{ inputs.app }} ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Slug de la app (p. ej. snappy-wasp)
+        required: true
+        type: string
+      repo:
+        description: Repo de la app (p. ej. javierferraz/2606-snappy-wasp)
+        required: true
+        type: string
+      tag:
+        description: Tag a construir, vX.Y.Z (admite sufijo de pruebas, p. ej. v1.6.2-factory-test)
+        required: true
+        type: string
+
+# El GITHUB_TOKEN solo lee esta fabrica. Todo lo del repo de la app va con APPS_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-pyside-linux-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Doble cerrojo: solo workflow_dispatch y solo con el workflow de main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # ubuntu-24.04 fijo, nunca ubuntu-latest: PyInstaller y el AppImage heredan la glibc del
+    # runner y ubuntu-latest ya trae 2.43, que no arranca en Ubuntu 22.04/24.04 (S-930).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Las entradas se usan siempre por variable de entorno, nunca interpoladas en el script.
+      APP: ${{ inputs.app }}
+      APP_REPO: ${{ inputs.repo }}
+      TAG: ${{ inputs.tag }}
+      # fpm fijado (los linux-build.yml de las apps instalaban la ultima).
+      FPM_VERSION: 1.18.0
+      # Python si requirements-build.txt no declara el suyo (el de los linux-build.yml de las apps).
+      PY_DEFAULT: '3.12'
+    steps:
+      - name: Validar entradas
+        id: meta
+        run: |
+          [[ "$APP" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::app no valido: '$APP'"; exit 1; }
+          [[ "$APP_REPO" =~ ^javierferraz/[A-Za-z0-9._-]+$ ]] || { echo "::error::repo no valido: '$APP_REPO'"; exit 1; }
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::tag no valido: '$TAG' (se espera vX.Y.Z o vX.Y.Z-sufijo)"; exit 1; }
+          VERSION="${BASH_REMATCH[1]}"
+          {
+            echo "version=$VERSION"
+            echo "appimage=$APP-v$VERSION-linux-x64.AppImage"
+            echo "deb=$APP-v$VERSION-linux-x64.deb"
+          } >> "$GITHUB_OUTPUT"
+          echo "OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+          {
+            echo "## $APP $TAG (PySide6, Linux)"; echo
+            echo "Repo \`$APP_REPO\`, version X.Y.Z \`$VERSION\`."; echo
+            echo '| Comprobacion | Resultado |'; echo '|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Antes de gastar el build: el token ve el repo y la Release no tiene ya estos ficheros
+      # (no se pisan nunca).
+      - name: Acceso al repo de la app y Release sin esos ficheros
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          gh api "repos/$APP_REPO" --jq .full_name > /dev/null 2>&1 || { echo "::error::APPS_TOKEN no puede leer $APP_REPO (token vacio, caducado o sin ese repo)"; exit 1; }
+          if names="$(gh api "repos/$APP_REPO/releases/tags/$TAG" --jq '.assets[].name' 2>/dev/null)"; then
+            clash="$(grep -Fx -e "$APPIMAGE" -e "$DEB" -e linux-SHA256SUMS.txt <<< "$names" | paste -sd, - || true)"
+            [ -z "$clash" ] || { echo "::error::La Release $TAG ya tiene: $clash. No se pisan; borralos a mano si hay que rehacerlos."; exit 1; }
+            echo "| Release $TAG | ya existe, sin ficheros de Linux |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Release $TAG | no existe; se creara como prerelease |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout de la fabrica
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: factory
+          persist-credentials: false
+
+      - name: Checkout de la app en el tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repo }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.APPS_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - name: El tag coincide con la version; scripts de Linux, Python y PyInstaller
+        id: conf
+        working-directory: app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          [ -f utils/version.py ] || { echo "::error::Falta utils/version.py (los scripts de Linux leen ahi __version__)"; exit 1; }
+          APP_VERSION="$(grep -oP '^__version__\s*=\s*"\K[^"]+' utils/version.py || true)"
+          [ "$APP_VERSION" = "$VERSION" ] || { echo "::error::utils/version.py dice '$APP_VERSION' y el tag $TAG pide '$VERSION'"; exit 1; }
+          for s in build-appimage.sh build-packages.sh; do
+            [ -f "packaging/linux/$s" ] || { echo "::error::Falta packaging/linux/$s"; exit 1; }
+          done
+          [ -f requirements.txt ] || { echo "::error::Falta requirements.txt"; exit 1; }
+          PY="$PY_DEFAULT"; PY_FROM='por defecto (requirements-build.txt no declara Interprete)'
+          PYI='pyinstaller'; PYI_FROM='la ultima (requirements-build.txt no la fija)'
+          if [ -f requirements-build.txt ]; then
+            if v="$(grep -oP 'CPython \K[0-9]+\.[0-9]+\.[0-9]+' requirements-build.txt | head -n1)" && [ -n "$v" ]; then
+              PY="$v"; PY_FROM='requirements-build.txt, el mismo que en Windows'
+            fi
+            pins="$(grep -ioP '^(pyinstaller|pyinstaller-hooks-contrib)==[0-9A-Za-z.]+' requirements-build.txt || true)"
+            if grep -qi '^pyinstaller==' <<< "$pins"; then
+              PYI="$(xargs <<< "$pins")"; PYI_FROM='requirements-build.txt'
+            fi
+          fi
+          echo "python=$PY" >> "$GITHUB_OUTPUT"
+          echo "pyinstaller=$PYI" >> "$GITHUB_OUTPUT"
+          echo "| Version | utils/version.py = $VERSION; commit $(git rev-parse --short HEAD) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Python | $PY ($PY_FROM) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PyInstaller | \`$PYI\` ($PYI_FROM) |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Las del linux-build.yml de las apps. Las que algunas apps anaden (Bison y Ant: las de Qt
+      # offscreen y PulseAudio) vienen de config/linux-apt-extra.txt, para no cambiar lo que
+      # PyInstaller empaqueta en las demas.
+      - name: Prerrequisitos del sistema
+        run: |
+          extra=()
+          while read -r slug pkgs; do
+            [ "$slug" = "$APP" ] || continue
+            for p in $pkgs; do
+              [[ "$p" =~ ^[a-z0-9][a-z0-9.+-]+$ ]] || { echo "::error::paquete no valido en config/linux-apt-extra.txt: '$p'"; exit 1; }
+              extra+=("$p")
+            done
+          done < <(sed -E 's/#.*$//' factory/config/linux-apt-extra.txt)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq patchelf libxcb-cursor0 xdg-utils ruby ruby-dev build-essential libasound2-dev "${extra[@]}"
+          sudo gem install --no-document fpm -v "$FPM_VERSION"
+          echo "| Sistema | fpm $FPM_VERSION; paquetes extra: ${extra[*]:-ninguno} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.conf.outputs.python }}
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: AppImage y .deb (scripts de la app)
+        working-directory: app
+        env:
+          PYI: ${{ steps.conf.outputs.pyinstaller }}
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          # shellcheck disable=SC2086  # PYI son uno o dos requisitos "nombre==version"
+          pip install --disable-pip-version-check -q -r requirements.txt $PYI
+          bash packaging/linux/build-appimage.sh
+          PATH="$(ruby -e 'puts Gem.bindir'):$PATH" bash packaging/linux/build-packages.sh
+          echo "| Build | $(python -c 'import platform; print("CPython", platform.python_version())'), PyInstaller $(pyinstaller --version), PySide6 $(python -c 'import PySide6; print(PySide6.__version__)') |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Artefactos, version del .deb, glibc y runtime del AppImage
+        working-directory: app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          [ -f "$APPIMAGE" ] || { echo "::error::build-appimage.sh no dejo $APPIMAGE en la raiz"; exit 1; }
+          [ -f "$DEB" ] || { echo "::error::build-packages.sh no dejo $DEB en la raiz"; exit 1; }
+          cp "$APPIMAGE" "$DEB" "$OUT/"
+          chmod +x "$OUT/$APPIMAGE"
+
+          # fpm pone la iteracion (-1) detras de la version.
+          DEB_VERSION="$(dpkg-deb -f "$OUT/$DEB" Version)"
+          DEB_ARCH="$(dpkg-deb -f "$OUT/$DEB" Architecture)"
+          [[ "$DEB_VERSION" = "$VERSION" || "$DEB_VERSION" = "$VERSION"-* ]] || { echo "::error::el .deb declara '$DEB_VERSION', se esperaba '$VERSION'"; exit 1; }
+          [ "$DEB_ARCH" = amd64 ] || { echo "::error::el .deb es '$DEB_ARCH', se esperaba amd64"; exit 1; }
+          echo "| .deb | Package $(dpkg-deb -f "$OUT/$DEB" Package), Version $DEB_VERSION, $DEB_ARCH; Depends: $(dpkg-deb -f "$OUT/$DEB" Depends | tr '|' '/') |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Runtime estatico (lleva libfuse dentro y cae a extract-and-run): sin el, el AppImage
+          # no arranca en Ubuntu 22.04/24.04 sin libfuse2 y falla en silencio.
+          if readelf -d "$OUT/$APPIMAGE" 2>/dev/null | grep -q 'NEEDED.*libfuse'; then
+            echo "::error::El runtime del AppImage enlaza libfuse: no arrancaria sin libfuse2"; exit 1
+          fi
+
+          # glibc: lo que de verdad se entrega, el AppImage abierto y el .deb desempaquetado.
+          # Ningun binario puede pedir mas que la de Ubuntu 24.04 (2.39), S-930.
+          X="$RUNNER_TEMP/inspect"
+          rm -rf "$X"; mkdir -p "$X/deb"
+          (cd "$X" && "$OUT/$APPIMAGE" --appimage-extract > /dev/null)
+          dpkg-deb -x "$OUT/$DEB" "$X/deb"
+          MAX="$(find "$X" -type f \( -perm -u+x -o -name '*.so*' \) -exec objdump -T {} + 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 || true)"
+          [ -n "$MAX" ] || { echo "::error::objdump no encontro ningun simbolo de glibc: la comprobacion no ha mirado nada"; exit 1; }
+          [ "$(printf '%s\nGLIBC_2.39\n' "$MAX" | sort -V | tail -1)" = GLIBC_2.39 ] || { echo "::error::$MAX > GLIBC_2.39: no arrancaria en Ubuntu 24.04"; exit 1; }
+          AI_FILES="$(find "$X/squashfs-root" -type f | wc -l)"
+          DEB_FILES="$(find "$X/deb" -type f | wc -l)"
+          rm -rf "$X"
+          echo "| glibc | la mas alta que piden AppImage y .deb: $MAX (<= 2.39); runtime del AppImage sin libfuse |" >> "$GITHUB_STEP_SUMMARY"
+
+          cd "$OUT"
+          sha256sum "$APPIMAGE" "$DEB" > linux-SHA256SUMS.txt
+          while read -r sha name; do
+            echo "| $name | $(( $(stat -c %s "$name") / 1048576 )) MB, SHA256 \`$sha\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < linux-SHA256SUMS.txt
+          echo "| Contenido | AppImage $AI_FILES ficheros, .deb $DEB_FILES ficheros |" >> "$GITHUB_STEP_SUMMARY"
+
+      # A la Release, no a un artifact de Actions (los artifacts cuentan contra los 500 MB del
+      # plan gratis). Si no existe, se crea como prerelease. Si el job de Windows la crea a la
+      # vez, el create falla y se sigue con la que ya existe.
+      - name: Subir a la Release del repo de la app
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          if gh release view "$TAG" -R "$APP_REPO" > /dev/null 2>&1; then
+            created='ya existia'
+          elif gh release create "$TAG" -R "$APP_REPO" --prerelease --verify-tag --title "$APP $TAG" --notes 'Linux build from the release factory (AppImage and .deb). Not published yet.'; then
+            created='creada como prerelease'
+          elif gh release view "$TAG" -R "$APP_REPO" > /dev/null 2>&1; then
+            created='la creo otro job a la vez'
+          else
+            echo "::error::No se pudo crear la Release $TAG"; exit 1
+          fi
+          names="$(gh release view "$TAG" -R "$APP_REPO" --json assets --jq '.assets[].name')"
+          clash="$(grep -Fx -e "$APPIMAGE" -e "$DEB" -e linux-SHA256SUMS.txt <<< "$names" | paste -sd, - || true)"
+          [ -z "$clash" ] || { echo "::error::La Release ya tiene: $clash. No se pisan."; exit 1; }
+          cd "$OUT"
+          gh release upload "$TAG" -R "$APP_REPO" "$APPIMAGE" "$DEB" linux-SHA256SUMS.txt
+          echo "| Release $TAG | $created; subidos \`$APPIMAGE\`, \`$DEB\` y \`linux-SHA256SUMS.txt\` |" >> "$GITHUB_STEP_SUMMARY"
