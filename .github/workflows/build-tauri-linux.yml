@@ -1,0 +1,260 @@
+name: Build Tauri (Linux)
+
+# Construye el AppImage y el .deb de una app Tauri de la suite en ubuntu-24.04, pasa sus tests
+# (npm test y cargo test --lib: aqui y solo aqui, Linux factura la mitad que Windows) y los deja
+# en la Release <tag> del repo de la app, creandola como prerelease si no existe. NO publica
+# nada: ni FTP, ni manifest, ni web (eso es R6). Paquete R5 de
+# docs/distribucion/releases-automaticas.md (repo central, S-1069).
+#
+# Mismo build que el linux-build.yml de cada app (patron de Bright Cardinal y Smart Greenjay,
+# que es el de los build-<slug>.sh de Cat, Chicken, Lion y Tiger): tauri build --bundles
+# appimage deb con tauri.linux.conf.json, artefactos filtrados por version, glibc <= 2.39.
+# Sin ficheros del actualizador: Linux no los usa (el manifest solo lleva sha256); se apagan
+# con --config, sin tocar el repo de la app.
+#
+# Solo se dispara a mano (o desde el «si» de la tanda, R8): no hay entornos con aprobacion
+# en el plan gratuito, asi que la puerta humana es el propio disparo.
+#   gh workflow run build-tauri-linux.yml -R javierferraz/tsp-release-factory \
+#     -f app=bright-cardinal -f repo=javierferraz/2610-bright-cardinal -f tag=v1.0.0
+
+run-name: Linux ${{ inputs.app }} ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Slug de la app (p. ej. bright-cardinal)
+        required: true
+        type: string
+      repo:
+        description: Repo de la app (p. ej. javierferraz/2610-bright-cardinal)
+        required: true
+        type: string
+      tag:
+        description: Tag a construir, vX.Y.Z (admite sufijo de pruebas, p. ej. v1.0.0-factory-test)
+        required: true
+        type: string
+
+# El GITHUB_TOKEN no se usa para nada del repo de la app: todo va con APPS_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-tauri-linux-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Doble cerrojo: solo workflow_dispatch y solo con el workflow de main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # ubuntu-24.04 fijo, nunca ubuntu-latest: el bundler empaqueta las bibliotecas del runner y
+    # ubuntu-latest ya trae glibc 2.43, que no arranca en Ubuntu 22.04/24.04 ni Mint 22 (S-930).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Las entradas se usan siempre por variable de entorno, nunca interpoladas en el script.
+      APP: ${{ inputs.app }}
+      APP_REPO: ${{ inputs.repo }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validar entradas
+        id: meta
+        run: |
+          [[ "$APP" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::app no valido: '$APP'"; exit 1; }
+          [[ "$APP_REPO" =~ ^javierferraz/[A-Za-z0-9._-]+$ ]] || { echo "::error::repo no valido: '$APP_REPO'"; exit 1; }
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::tag no valido: '$TAG' (se espera vX.Y.Z o vX.Y.Z-sufijo)"; exit 1; }
+          VERSION="${BASH_REMATCH[1]}"
+          {
+            echo "version=$VERSION"
+            echo "appimage=$APP-v$VERSION-linux-x64.AppImage"
+            echo "deb=$APP-v$VERSION-linux-x64.deb"
+          } >> "$GITHUB_OUTPUT"
+          echo "OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/out"
+          {
+            echo "## $APP $TAG (Linux)"; echo
+            echo "Repo \`$APP_REPO\`, version X.Y.Z \`$VERSION\`."; echo
+            echo '| Comprobacion | Resultado |'; echo '|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Antes de gastar el build: el token ve el repo y la Release no tiene ya estos ficheros
+      # (no se pisan nunca).
+      - name: Acceso al repo de la app y Release sin esos ficheros
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          gh api "repos/$APP_REPO" --jq .full_name > /dev/null 2>&1 || { echo "::error::APPS_TOKEN no puede leer $APP_REPO (token vacio, caducado o sin ese repo)"; exit 1; }
+          if names="$(gh api "repos/$APP_REPO/releases/tags/$TAG" --jq '.assets[].name' 2>/dev/null)"; then
+            clash="$(grep -Fx -e "$APPIMAGE" -e "$DEB" -e linux-SHA256SUMS.txt <<< "$names" | paste -sd, - || true)"
+            [ -z "$clash" ] || { echo "::error::La Release $TAG ya tiene: $clash. No se pisan; borralos a mano si hay que rehacerlos."; exit 1; }
+            echo "| Release $TAG | ya existe, sin ficheros de Linux |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Release $TAG | no existe; se creara como prerelease |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout de la app en el tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.repo }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.APPS_TOKEN }}
+          path: app
+          persist-credentials: false
+
+      - name: El tag coincide con la version de tauri.conf.json
+        id: conf
+        working-directory: app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          [ -f src-tauri/tauri.linux.conf.json ] || { echo "::error::Falta src-tauri/tauri.linux.conf.json (targets appimage y deb)"; exit 1; }
+          CONF_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          if ! [[ "$CONF_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            # Tauri admite "version": "../package.json"
+            CONF_VERSION="$(jq -r .version "src-tauri/$CONF_VERSION")"
+          fi
+          [ "$CONF_VERSION" = "$VERSION" ] || { echo "::error::tauri.conf.json dice '$CONF_VERSION' y el tag $TAG pide '$VERSION'"; exit 1; }
+          PKG_VERSION="$(jq -r .version package.json)"
+          [ "$PKG_VERSION" = "$VERSION" ] || { echo "::error::package.json dice '$PKG_VERSION' y el tag pide '$VERSION'"; exit 1; }
+          echo "product=$(jq -r .productName src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+          echo "has_npm_test=$(jq -r 'if .scripts.test then "yes" else "no" end' package.json)" >> "$GITHUB_OUTPUT"
+          echo "| Version | tauri.conf.json y package.json = $VERSION; commit $(git rev-parse --short HEAD) |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Las mismas que el linux-build.yml de las apps. patchelf: sin el, el AppImage se queda
+      # colgado en el splash (tsp-linux-build §4.2).
+      - name: Prerrequisitos del sistema
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils gstreamer1.0-plugins-base gstreamer1.0-plugins-good libasound2-dev
+
+      - name: Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Rust estable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          echo "| Toolchain | $(node --version), $(rustc --version) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache de Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: app/src-tauri -> target
+          key: linux-${{ inputs.app }}
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      # Los tests de la app se pasan aqui, una sola vez por tanda: Linux factura la mitad que
+      # Windows y la capa platform/linux.rs solo se puede probar en Linux.
+      - name: Tests (npm test)
+        working-directory: app
+        env:
+          HAS_NPM_TEST: ${{ steps.conf.outputs.has_npm_test }}
+        run: |
+          if [ "$HAS_NPM_TEST" = yes ]; then
+            npm test
+            echo '| npm test | OK |' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '| npm test | la app no tiene script "test" en package.json |' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # dist/ tiene que existir: tauri::generate_context! lo embebe al compilar.
+      - name: Tests de Rust (cargo test --lib)
+        working-directory: app
+        run: |
+          npm run build
+          (cd src-tauri && cargo test --lib)
+          echo '| cargo test --lib | OK |' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: tauri build (AppImage + .deb)
+        working-directory: app
+        run: |
+          echo '{"bundle":{"createUpdaterArtifacts":false}}' > "$RUNNER_TEMP/factory.tauri.conf.json"
+          node node_modules/@tauri-apps/cli/tauri.js build --bundles appimage deb --config "$RUNNER_TEMP/factory.tauri.conf.json"
+
+      - name: Artefactos, version del .deb, glibc y runtime del AppImage
+        working-directory: app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+        run: |
+          # El filtro por _${VERSION}_ no es decorativo: bundle/ puede acumular versiones
+          # anteriores (incidente Clever Cat 1.3.6).
+          mapfile -t found_ai < <(find src-tauri/target/release/bundle/appimage/ -maxdepth 1 -name "*_${VERSION}_*.AppImage")
+          mapfile -t found_deb < <(find src-tauri/target/release/bundle/deb/ -maxdepth 1 -name "*_${VERSION}_*.deb")
+          [ "${#found_ai[@]}" -eq 1 ] || { echo "::error::Se esperaba 1 AppImage *_${VERSION}_* y hay ${#found_ai[@]}"; exit 1; }
+          [ "${#found_deb[@]}" -eq 1 ] || { echo "::error::Se esperaba 1 .deb *_${VERSION}_* y hay ${#found_deb[@]}"; exit 1; }
+          cp "${found_ai[0]}" "$OUT/$APPIMAGE"
+          cp "${found_deb[0]}" "$OUT/$DEB"
+          chmod +x "$OUT/$APPIMAGE"
+
+          DEB_VERSION="$(dpkg-deb -f "$OUT/$DEB" Version)"
+          DEB_ARCH="$(dpkg-deb -f "$OUT/$DEB" Architecture)"
+          [ "$DEB_VERSION" = "$VERSION" ] || { echo "::error::el .deb declara '$DEB_VERSION', se esperaba '$VERSION'"; exit 1; }
+          [ "$DEB_ARCH" = amd64 ] || { echo "::error::el .deb es '$DEB_ARCH', se esperaba amd64"; exit 1; }
+          echo "| .deb | Package $(dpkg-deb -f "$OUT/$DEB" Package), Version $DEB_VERSION, $DEB_ARCH; Depends: $(dpkg-deb -f "$OUT/$DEB" Depends | tr '|' '/') |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Runtime estatico (lleva libfuse dentro y cae a extract-and-run): sin el, el AppImage
+          # no arranca en Ubuntu 22.04/24.04 sin libfuse2 y falla en silencio.
+          if readelf -d "$OUT/$APPIMAGE" 2>/dev/null | grep -q 'NEEDED.*libfuse'; then
+            echo "::error::El runtime del AppImage enlaza libfuse: no arrancaria sin libfuse2"; exit 1
+          fi
+
+          # glibc: lo que de verdad se entrega, el AppImage abierto y el .deb desempaquetado.
+          # Ningun binario puede pedir mas que la de Ubuntu 24.04 (2.39), S-930.
+          X="$RUNNER_TEMP/inspect"
+          rm -rf "$X"; mkdir -p "$X/deb"
+          (cd "$X" && "$OUT/$APPIMAGE" --appimage-extract > /dev/null)
+          dpkg-deb -x "$OUT/$DEB" "$X/deb"
+          MAX="$(find "$X" -type f \( -perm -u+x -o -name '*.so*' \) -exec objdump -T {} + 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 || true)"
+          [ -n "$MAX" ] || { echo "::error::objdump no encontro ningun simbolo de glibc: la comprobacion no ha mirado nada"; exit 1; }
+          [ "$(printf '%s\nGLIBC_2.39\n' "$MAX" | sort -V | tail -1)" = GLIBC_2.39 ] || { echo "::error::$MAX > GLIBC_2.39: no arrancaria en Ubuntu 24.04"; exit 1; }
+          AI_FILES="$(find "$X/squashfs-root" -type f | wc -l)"
+          DEB_FILES="$(find "$X/deb" -type f | wc -l)"
+          rm -rf "$X"
+          echo "| glibc | la mas alta que piden AppImage y .deb: $MAX (<= 2.39); runtime del AppImage sin libfuse |" >> "$GITHUB_STEP_SUMMARY"
+
+          cd "$OUT"
+          sha256sum "$APPIMAGE" "$DEB" > linux-SHA256SUMS.txt
+          while read -r sha name; do
+            echo "| $name | $(( $(stat -c %s "$name") / 1048576 )) MB, SHA256 \`$sha\` |" >> "$GITHUB_STEP_SUMMARY"
+          done < linux-SHA256SUMS.txt
+          echo "| Contenido | AppImage $AI_FILES ficheros, .deb $DEB_FILES ficheros |" >> "$GITHUB_STEP_SUMMARY"
+
+      # A la Release, no a un artifact de Actions (los artifacts cuentan contra los 500 MB del
+      # plan gratis). Si no existe, se crea como prerelease. Si el job de Windows la crea a la
+      # vez, el create falla y se sigue con la que ya existe.
+      - name: Subir a la Release del repo de la app
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          APPIMAGE: ${{ steps.meta.outputs.appimage }}
+          DEB: ${{ steps.meta.outputs.deb }}
+          PRODUCT: ${{ steps.conf.outputs.product }}
+        run: |
+          if gh release view "$TAG" -R "$APP_REPO" > /dev/null 2>&1; then
+            created='ya existia'
+          elif gh release create "$TAG" -R "$APP_REPO" --prerelease --verify-tag --title "$PRODUCT $TAG" --notes 'Linux build from the release factory (AppImage and .deb). Not published yet.'; then
+            created='creada como prerelease'
+          elif gh release view "$TAG" -R "$APP_REPO" > /dev/null 2>&1; then
+            created='la creo otro job a la vez'
+          else
+            echo "::error::No se pudo crear la Release $TAG"; exit 1
+          fi
+          names="$(gh release view "$TAG" -R "$APP_REPO" --json assets --jq '.assets[].name')"
+          clash="$(grep -Fx -e "$APPIMAGE" -e "$DEB" -e linux-SHA256SUMS.txt <<< "$names" | paste -sd, - || true)"
+          [ -z "$clash" ] || { echo "::error::La Release ya tiene: $clash. No se pisan."; exit 1; }
+          cd "$OUT"
+          gh release upload "$TAG" -R "$APP_REPO" "$APPIMAGE" "$DEB" linux-SHA256SUMS.txt
+          echo "| Release $TAG | $created; subidos \`$APPIMAGE\`, \`$DEB\` y \`linux-SHA256SUMS.txt\` |" >> "$GITHUB_STEP_SUMMARY"
