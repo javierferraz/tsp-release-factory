@@ -157,6 +157,41 @@ Sneaky Spider no entra todavía: su versión está en `config.py` (`APP_VERSION`
 `utils/version.py` (tampoco entra en `build-pyside-windows`). Orderly Owl sí cumple el contrato
 aunque no tenga `linux-build.yml`. Crafty Fox no tiene `packaging/linux/`.
 
+## `publish.yml` — publicación de una tanda ya construida (R6)
+
+```
+gh workflow run publish.yml -R javierferraz/tsp-release-factory -f apps='[{"app":"bright-cardinal","repo":"javierferraz/2610-bright-cardinal","version":"1.0.0","platforms":["windows","linux"]}]'
+```
+
+**En seco por defecto** (`dry_run: true`): el FTPS y el `sign-manifest` se simulan en
+`127.0.0.1` (`scripts/mock_servers.py`), no hay push, ni deploy, ni se toca la Release, y los
+secretos del FTP y de la firma no llegan al paso. De verdad, además `-f dry_run=false`.
+
+Todo lo hace `scripts/publish.py` con los scripts del repo central, como el flujo manual
+(tsp-create-dist §3 y tsp-linux-build §5):
+
+1. Valida la tanda y saca el central (`main`) con `APPS_TOKEN`.
+2. Descarga los ficheros de la Release y comprueba tamaño, SHA256 (contra `SHA256SUMS` o contra
+   el manifest si esa versión ya estaba publicada), Authenticode (firmante y raíz de Microsoft,
+   con `signify`) y, en Tauri, el `.sig` con la pubkey de `tauri.conf.json`.
+3. Entrada del manifest: Windows estable, Linux experimental, notas en inglés de
+   `release-notes.json` de la Release; esquema con `validate_manifest.validate_schema`.
+4. `ftp_release.py --fabrica`: sube binarios, `SHA256SUMS` y el manifest firmado, **sin poda,
+   archivo en D: ni Sheets** (eso sigue siendo del portátil), y lo comprueba en una sesión FTP nueva.
+5. `<app>-latest.json` de Tauri, `sync_fallback_hrefs.py`, entrada en `news/`, commit y push del
+   central, `deploy_site.py` desde ese commit y `audit_releases.py --quick --sin-respaldo` de puerta.
+6. Release de prerelease a definitiva y resumen (Markdown en el run, JSON con texto para Telegram
+   en los artefactos).
+
+Una app que no pasa las comprobaciones se excluye y las demás siguen. Si algo falla después de
+subir al FTP, lo ya publicado se commitea en `main` (si no, la siguiente subida del manifest lo
+revertiría) y el resumen dice hasta dónde llegó. Repetir una tanda ya publicada no sube nada.
+`DOWNLOADS_HIDDEN` de `catalog.js` no se toca: se avisa.
+
+**Contrato con R7:** la Release lleva `release-notes.json` con `{"windows": "...", "linux": "..."}`,
+una o dos frases en inglés para quien usa la app, sin números de tarjeta. Sin él, en real no se
+publica (en seco sale como «En real esto pararía la publicación»).
+
 ## Dónde corre cada test
 
 Cada test, una sola vez por tanda y en Linux (la mitad de precio que Windows):
@@ -217,7 +252,7 @@ fallo.
 | `APPS_TOKEN` | PAT de grano fino con *Contents: read and write* en los repos de las apps (checkout y Releases) |
 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Firma Authenticode (Azure Trusted Signing, cuenta `kokoawebsign`, perfil `echocontrol-public`) |
 | `TAURI_KEY_<SLUG>` | Clave privada del actualizador de cada app Tauri (contenido del `<slug>-signing.key`, sin contraseña). El nombre sale del slug en mayúsculas con `_`: `bright-cardinal` → `TAURI_KEY_BRIGHT_CARDINAL` |
-| `RELEASE_SIGNING_SECRET`, `FTP_HOST`, `FTP_USER`, `FTP_PASS` | Para la publicación (R6); este workflow no los usa |
+| `RELEASE_SIGNING_SECRET`, `FTP_HOST`, `FTP_USER`, `FTP_PASS` | Solo `publish.yml` en real (R6): firma del manifest y FTP. Además, `APPS_TOKEN` tiene que poder leer y escribir en `javierferraz/2606-thestromboliproject` (push del manifest) |
 
 Añadir una app Tauri nueva = darle acceso a `APPS_TOKEN` sobre su repo y grabar su
 `TAURI_KEY_<SLUG>` (`gh secret set TAURI_KEY_<SLUG> -R javierferraz/tsp-release-factory < <slug>-signing.key`).

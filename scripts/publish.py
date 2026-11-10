@@ -1,0 +1,1155 @@
+"""publish.py — publica una tanda de Releases ya construidas por la fabrica (R6, S-1069).
+
+Convierte la Release vX.Y.Z de cada app (instalador firmado, .sig del actualizador de Tauri,
+SHA256SUMS, AppImage y .deb) en una publicacion completa, con el mismo resultado que el flujo
+manual de tsp-create-dist §3 y tsp-linux-build §5, usando los scripts del repo central:
+
+  1. Entradas y Release: la Release existe, no es borrador y trae los ficheros esperados.
+  2. Descarga y comprobacion: tamano, SHA256 (contra SHA256SUMS de la Release o contra el
+     manifest si esa version ya estaba publicada), Authenticode del instalador (firmante
+     esperado y cadena de Microsoft) y, en Tauri, el .sig contra la pubkey de tauri.conf.json.
+  3. Entrada del manifest (Windows estable, Linux experimental, notas en ingles de
+     release-notes.json) y esquema validado con validate_manifest.validate_schema.
+  4-5. ftp_release.py --fabrica (sube binarios + SHA256SUMS + manifest firmado por
+     sign-manifest, sin poda ni archivo) y comprobacion en una sesion FTP NUEVA.
+  6. <app>-latest.json de Tauri, sync_fallback_hrefs.py, entrada en news/, commit y push
+     del central, deploy_site.py desde ese commit y audit_releases.py --quick --sin-respaldo.
+  7. Release de prerelease a definitiva y resumen (Markdown + JSON para Telegram).
+
+Por defecto es EN SECO: FTP y sign-manifest simulados en 127.0.0.1 (mock_servers.py), sin
+push, sin deploy real y sin tocar la Release. Publicar de verdad exige --publicar.
+
+Uso:
+  python publish.py --central DIR --work DIR --apps '<json>' [--publicar]
+                    [--resumen FICHERO.md] [--resultado FICHERO.json] [--inicio-job EPOCH]
+                    [--notas slug=FICHERO]... [--entrada-previa slug=REV]...   (solo en seco)
+
+--apps: [{"app": "bright-cardinal", "repo": "javierferraz/2610-bright-cardinal",
+          "version": "1.0.0", "platforms": ["windows", "linux"]}, ...]
+
+Contrato con R7 (quien prepara la tanda): la Release lleva un fichero release-notes.json con
+{"windows": "...", "linux": "..."}: una o dos frases en ingles para quien usa la app, sin
+numeros de tarjeta ni nombres de ficheros. "windows" va al manifest, a <app>-latest.json y a
+news/; "linux", a la entrada linux-x64 del manifest.
+"""
+import argparse
+import datetime
+import hashlib
+import html
+import importlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+FACTORY = Path(__file__).resolve().parent.parent
+SITE = 'https://thestromboliproject.com'
+UPDATES_PREFIX = f'{SITE}/updates/'
+EXPECTED_SIGNER = 'CN=Francisco Javier Ferraz Rives'
+MS_ROOT = 'CN=Microsoft Identity Verification Root Certificate Authority 2020'
+SLUG_RE = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
+REPO_RE = re.compile(r'^javierferraz/[A-Za-z0-9._-]+$')
+VER_RE = re.compile(r'^\d+\.\d+\.\d+$')
+LABELS_TAURI = {'deb': 'Ubuntu 24.04+ / Debian 13+', 'AppImage': 'Other distros / Ubuntu 22.04'}
+LABELS_PYSIDE = {'deb': 'Ubuntu / Debian', 'AppImage': 'Other distros'}
+MOCK_FTP_PORT = 21
+SPANISH_HINTS = (' el ', ' la ', ' los ', ' las ', ' que ', ' para ', ' con ', ' una ', ' del ', ' ahora ')
+
+
+class Fallo(Exception):
+    """Un paso no se puede dar. El mensaje es lo que sale en el resumen."""
+
+
+# ───────────────────────────── utilidades ─────────────────────────────
+
+def run(cmd, cwd=None, env=None, check=True, timeout=1800, log=None, label=None):
+    """Ejecuta sin consola visible. Devuelve CompletedProcess; con log, vuelca ahi la salida."""
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, encoding='utf-8',
+                       errors='replace', timeout=timeout, creationflags=flags)
+    if log:
+        with open(log, 'a', encoding='utf-8') as fh:
+            fh.write(f'$ {" ".join(str(c) for c in cmd[:6])}{" ..." if len(cmd) > 6 else ""}\n')
+            fh.write(p.stdout or '')
+            fh.write(p.stderr or '')
+            fh.write(f'[exit {p.returncode}]\n\n')
+    if check and p.returncode != 0:
+        tail = ((p.stdout or '') + (p.stderr or '')).strip().splitlines()[-6:]
+        name = label or Path(str(cmd[1] if len(cmd) > 1 else cmd[0])).name
+        raise Fallo(f'{name} salio con {p.returncode}: ' + ' | '.join(tail))
+    return p
+
+
+def gh(*args, check=True):
+    return run(['gh', *args], check=check, timeout=600)
+
+
+def git(central, *args, check=True):
+    return run(['git', '-C', str(central), *args], check=check, timeout=600)
+
+
+def git_auth(central, *args, check=True):
+    """git con las credenciales de gh (GH_TOKEN en el runner) solo para esta orden."""
+    return git(central, '-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential',
+               *args, check=check)
+
+
+def semver(v):
+    return tuple(int(x) for x in v.split('.'))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dump_json(data):
+    return json.dumps(data, ensure_ascii=False, indent=2) + '\n'
+
+
+def write_json(path, data):
+    Path(path).write_bytes(dump_json(data).encode('utf-8'))
+
+
+def url_release(slug, version, name):
+    return f'{SITE}/releases/{slug}/v{version}/{name}'
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# ───────────────────────────── entradas ─────────────────────────────
+
+def parse_apps(text):
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise Fallo(f'--apps no es JSON valido: {e}')
+    if not isinstance(data, list) or not data:
+        raise Fallo('--apps tiene que ser una lista no vacia')
+    seen, out = set(), []
+    for item in data:
+        if not isinstance(item, dict) or set(item) != {'app', 'repo', 'version', 'platforms'}:
+            raise Fallo(f'entrada de --apps con claves inesperadas: {item!r}')
+        app, repo, ver, plats = item['app'], item['repo'], item['version'], item['platforms']
+        if not isinstance(app, str) or not SLUG_RE.match(app):
+            raise Fallo(f'app no valida: {app!r}')
+        if not isinstance(repo, str) or not REPO_RE.match(repo):
+            raise Fallo(f'repo no valido: {repo!r}')
+        if not isinstance(ver, str) or not VER_RE.match(ver):
+            raise Fallo(f'version no valida: {ver!r} (X.Y.Z)')
+        if (not isinstance(plats, list) or not plats or len(set(plats)) != len(plats)
+                or not set(plats) <= {'windows', 'linux'}):
+            raise Fallo(f'platforms no valido para {app}: {plats!r}')
+        if app in seen:
+            raise Fallo(f'{app} aparece dos veces')
+        seen.add(app)
+        out.append({'app': app, 'repo': repo, 'version': ver, 'platforms': sorted(plats, reverse=True)})
+    return out
+
+
+def parse_pairs(values, what):
+    out = {}
+    for v in values or []:
+        k, sep, rest = v.partition('=')
+        if not sep or not SLUG_RE.match(k) or not rest:
+            raise Fallo(f'{what} espera slug=valor: {v!r}')
+        out[k] = rest
+    return out
+
+
+def parse_sums(text):
+    """{fichero: sha256} de un SHA256SUMS ('hash  nombre' o 'hash *nombre')."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and re.fullmatch(r'[0-9a-fA-F]{64}', parts[0]):
+            out[parts[1].lstrip('*')] = parts[0].lower()
+    return out
+
+
+def check_notes(notes, platforms):
+    """Valida release-notes.json. Devuelve {'windows': str, 'linux': str} (las que hagan falta)."""
+    if not isinstance(notes, dict):
+        raise Fallo('release-notes.json no es un objeto')
+    out = {}
+    for plat in platforms:
+        text = notes.get(plat)
+        if not isinstance(text, str) or not text.strip():
+            raise Fallo(f'release-notes.json no trae "{plat}"')
+        text = ' '.join(text.split())
+        if re.search(r'\bS-\d{2,5}\b', text):
+            raise Fallo(f'las notas de {plat} citan una tarjeta (S-NNN): son texto para el usuario')
+        low = f' {text.lower()} '
+        if sum(1 for w in SPANISH_HINTS if w in low) >= 3:
+            raise Fallo(f'las notas de {plat} parecen estar en castellano: van en ingles')
+        out[plat] = text
+    return out
+
+
+# ───────────────────────────── central ─────────────────────────────
+
+def display_name(central, slug):
+    text = (central / 'site' / 'assets' / 'catalog.js').read_text(encoding='utf-8')
+    m = re.search(r'id:\s*"' + re.escape(slug) + r'"\s*,(.{0,1500}?)\bname:\s*"([^"]+)"', text, re.S)
+    if not m or re.search(r'\bid:\s*"', m.group(1)):
+        raise Fallo(f'{slug} no esta en site/assets/catalog.js: sin nombre para el manifest')
+    return m.group(2)
+
+
+def downloads_hidden(central, slug):
+    text = (central / 'site' / 'assets' / 'catalog.js').read_text(encoding='utf-8')
+    m = re.search(r'const\s+DOWNLOADS_HIDDEN\s*=\s*\[([^\]]*)\]', text)
+    return bool(m) and f'"{slug}"' in m.group(1)
+
+
+def load_central_module(central, name):
+    scripts = str(central / 'scripts')
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    return importlib.import_module(name)
+
+
+def credentials_host(central):
+    path = central / 'credentials.json'
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding='utf-8')).get('_ftp_host')
+
+
+# ───────────────────────────── manifest ─────────────────────────────
+
+def platform_state(cur_ver, cur_shas, new_ver, new_shas, label):
+    """'nueva' o 'igual'; Fallo si la version baja o si se pisaria una URL publicada."""
+    if not cur_ver:
+        return 'nueva'
+    if semver(new_ver) > semver(cur_ver):
+        return 'nueva'
+    if semver(new_ver) < semver(cur_ver):
+        raise Fallo(f'{label}: {new_ver} es anterior a la publicada {cur_ver}')
+    if cur_shas == new_shas:
+        return 'igual'
+    raise Fallo(f'{label}: {new_ver} ya esta publicada con otros ficheros (SHA256 distinto); '
+                'una URL publicada no se pisa nunca')
+
+
+def windows_current(entry):
+    win = (entry or {}).get('platforms', {}).get('windows-x64') or {}
+    if not win.get('installer_url'):
+        return None, None
+    return win.get('version') or entry.get('version'), win
+
+
+def linux_current(entry):
+    lin = (entry or {}).get('platforms', {}).get('linux-x64') or {}
+    if not lin.get('installer_url'):
+        return None, None
+    return lin.get('version'), lin
+
+
+def update_ordered(prev, values, order):
+    new = dict(prev or {})
+    for k in order:
+        new[k] = values[k]
+    return new
+
+
+def windows_block(prev, slug, version, setup, portable, fmt, notes):
+    """setup/portable: {'name', 'size', 'sha256'} (portable puede ser None)."""
+    values = {
+        'status': 'stable',
+        'version': version,
+        'installer_url': url_release(slug, version, setup['name']),
+        'portable_url': url_release(slug, version, portable['name']) if portable else None,
+        'sha256': setup['sha256'],
+        'format': fmt,
+        'installer_size': setup['size'],
+        'portable_size': portable['size'] if portable else None,
+        'notes': notes,
+    }
+    return update_ordered(prev, values, list(values))
+
+
+def linux_block(prev, slug, version, appimage, deb, tauri, notes):
+    labels = dict(LABELS_TAURI if tauri else LABELS_PYSIDE)
+    for a in (prev or {}).get('assets') or []:
+        if isinstance(a, dict) and a.get('format') in labels and a.get('label'):
+            labels[a['format']] = a['label']
+
+    def asset(fmt, f):
+        return {'format': fmt, 'label': labels[fmt], 'url': url_release(slug, version, f['name']),
+                'sha256': f['sha256'], 'size': f['size'], 'status': 'experimental'}
+
+    values = {
+        'status': 'experimental',
+        'version': version,
+        'assets': [asset('deb', deb), asset('AppImage', appimage)],
+        'installer_url': url_release(slug, version, appimage['name']),
+        'portable_url': None,
+        'sha256': appimage['sha256'],
+        'format': 'AppImage',
+        'notes': notes,
+        'installer_size': appimage['size'],
+        'portable_size': None,
+    }
+    return update_ordered(prev, values, list(values))
+
+
+def planned_block(fmt):
+    return {'status': 'planned', 'installer_url': None, 'portable_url': None, 'sha256': None,
+            'format': fmt, 'notes': None, 'installer_size': None, 'portable_size': None}
+
+
+def apply_plan(manifest, plan, today):
+    """Aplica a manifest (en memoria) lo que el plan publica. Devuelve la entrada resultante."""
+    tools = manifest.setdefault('tools', [])
+    entry = next((t for t in tools if t.get('tool') == plan['app']), None)
+    if entry is None:
+        entry = {'tool': plan['app'], 'display_name': plan['display_name'], 'version': plan['version'],
+                 'channel': 'stable', 'release_date': today, 'download_page': f"{SITE}/tools/{plan['app']}/",
+                 'notes_url': plan['notes_url'],
+                 'platforms': {'windows-x64': planned_block(plan['windows_format']),
+                               'linux-x64': planned_block('AppImage'),
+                               'macos-arm64': planned_block('dmg')}}
+        tools.append(entry)
+    if plan.get('windows_block'):
+        entry['platforms']['windows-x64'] = plan['windows_block']
+        entry['version'] = plan['version']
+        entry['release_date'] = today
+    if plan.get('linux_block'):
+        entry['platforms']['linux-x64'] = plan['linux_block']
+    return entry
+
+
+def latest_json(version, notes, pub_date, signature, url):
+    return {'version': version, 'notes': notes, 'pub_date': pub_date,
+            'platforms': {'windows-x86_64': {'signature': signature, 'url': url}}}
+
+
+# ───────────────────────────── novedades ─────────────────────────────
+
+NEWS_ANCHOR = '<div class="news-list">'
+
+
+def news_has(text, slug, version):
+    for art in re.findall(r'<article class="news-item">(.*?)</article>', text, re.S):
+        if f'href="/tools/{slug}/"' in art and f'<p class="version">Version {version}</p>' in art:
+            return True
+    return False
+
+
+def news_insert(text, date, name, version, notes, slug):
+    """Devuelve el HTML con la entrada nueva arriba del todo, o el mismo si ya estaba."""
+    if news_has(text, slug, version):
+        return text
+    nl = '\r\n' if '\r\n' in text else '\n'
+    i = text.find(NEWS_ANCHOR)
+    if i < 0:
+        raise Fallo('site/news/index.html sin <div class="news-list">')
+    j = text.index('\n', i) + 1
+    block = [
+        '',
+        '          <article class="news-item">',
+        f'            <time datetime="{date}">{date}</time>',
+        f'            <h3>{html.escape(name, quote=False)}</h3>',
+        f'            <p class="version">Version {version}</p>',
+        f'            <p>{html.escape(notes, quote=False)}</p>',
+        f'            <a href="/tools/{slug}/">Tool page →</a>',
+        '          </article>',
+    ]
+    return text[:j] + nl.join(block) + nl + text[j:]
+
+
+# ───────────────────────────── firmas ─────────────────────────────
+
+def verify_authenticode(path):
+    """Devuelve el firmante. Fallo si la firma no vale o no es la esperada."""
+    try:
+        from signify.authenticode import AuthenticodeFile, AuthenticodeVerificationResult
+    except Exception as e:   # p. ej. oscrypto 1.3.0 con OpenSSL 3.0.10+: no sabe leer su version
+        raise Fallo(f'no se puede comprobar Authenticode en esta maquina ({type(e).__name__}: {e})')
+    with open(path, 'rb') as fh:
+        af = AuthenticodeFile.from_stream(fh)
+        result, err = af.explain_verify()
+        if result != AuthenticodeVerificationResult.OK:
+            raise Fallo(f'Authenticode de {Path(path).name}: {result.name} ({err})')
+        chains = []
+        for sd in af.iter_signatures():
+            chains.extend(sd.verify())
+    for chain in chains:
+        dns = [c.subject.dn for c in chain]
+        if dns and dns[0].startswith(MS_ROOT) and dns[-1].startswith(EXPECTED_SIGNER):
+            return dns[-1].split(',')[0][3:]
+    raise Fallo(f'Authenticode de {Path(path).name}: firmado, pero no por {EXPECTED_SIGNER} '
+                f'con la raiz de Microsoft ({[[c.subject.dn for c in ch] for ch in chains]})')
+
+
+def verify_minisign(path, sig, pubkey):
+    run([sys.executable, '-I', str(FACTORY / 'scripts' / 'verify_minisign.py'), str(path), str(sig), pubkey])
+
+
+# ───────────────────────────── informe ─────────────────────────────
+
+class Informe:
+    def __init__(self, seco):
+        self.seco = seco
+        self.apps = {}
+        self.pasos = []      # (paso, estado, detalle)
+        self.avisos = []
+        self.real_fallaria = []
+        self.hasta = 'inicio'
+
+    def app(self, slug, **kw):
+        self.apps.setdefault(slug, {'app': slug, 'estado': 'pendiente', 'comprobaciones': []}).update(kw)
+
+    def check(self, slug, texto):
+        self.app(slug)
+        self.apps[slug]['comprobaciones'].append(texto)
+        print(f'  [{slug}] {texto}', flush=True)
+
+    def paso(self, paso, estado, detalle=''):
+        self.pasos.append((paso, estado, detalle))
+        if estado == 'ok' and paso[0].isdigit():   # el rescate no es un paso de la publicacion
+            self.hasta = paso
+        print(f'== {paso}: {estado} {detalle}', flush=True)
+
+    def fallaria(self, slug, texto):
+        """En seco se sigue, pero en real esto pararia: cuenta como fallo del dry-run."""
+        if not self.seco:
+            raise Fallo(texto)
+        self.real_fallaria.append(f'{slug}: {texto}')
+        self.check(slug, f'AVISO (en real fallaria): {texto}')
+
+
+# ───────────────────────────── fase 1: preparar ─────────────────────────────
+
+def release_info(repo, tag):
+    p = gh('release', 'view', tag, '-R', repo, '--json', 'tagName,isDraft,isPrerelease,name,assets,url',
+           check=False)
+    if p.returncode != 0:
+        raise Fallo(f'no se puede leer la Release {tag} de {repo}: {(p.stderr or p.stdout).strip()[:200]}')
+    return json.loads(p.stdout)
+
+
+def repo_file(repo, tag, path):
+    p = gh('api', '-H', 'Accept: application/vnd.github.raw', f'repos/{repo}/contents/{path}?ref={tag}',
+           check=False)
+    if p.returncode != 0:
+        if 'HTTP 404' in (p.stderr or ''):
+            return None
+        raise Fallo(f'no se puede leer {path} de {repo}@{tag}: {(p.stderr or "").strip()[:200]}')
+    return p.stdout
+
+
+def tauri_conf(repo, tag, version):
+    text = repo_file(repo, tag, 'src-tauri/tauri.conf.json')
+    if text is None:
+        return None
+    conf = json.loads(text)
+    conf_ver = conf.get('version')
+    if conf_ver and not VER_RE.match(str(conf_ver)):
+        pkg = repo_file(repo, tag, 'package.json')
+        conf_ver = json.loads(pkg).get('version') if pkg else None
+    if conf_ver != version:
+        raise Fallo(f'tauri.conf.json dice {conf_ver!r} y se publica {version}')
+    return conf
+
+
+def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch=None):
+    slug, repo, ver, plats = spec['app'], spec['repo'], spec['version'], spec['platforms']
+    tag = f'v{ver}'
+    rel = release_info(repo, tag)
+    if rel.get('isDraft'):
+        raise Fallo(f'la Release {tag} es un borrador')
+    sizes = {a['name']: a['size'] for a in rel.get('assets', [])}
+    rep.check(slug, f"Release {tag}: {'prerelease' if rel.get('isPrerelease') else 'definitiva'}, "
+                    f'{len(sizes)} ficheros')
+
+    conf = tauri_conf(repo, tag, ver)
+    tauri = conf is not None
+    want, optional = [], []
+    names = {}
+    if 'windows' in plats:
+        names['setup'] = f'{slug}-v{ver}-windows-x64-setup.exe'
+        want.append(names['setup'])
+        if tauri:
+            want.append(names['setup'] + '.sig')
+        optional.append(f'{slug}-v{ver}-windows-x64-portable.zip')
+    if 'linux' in plats:
+        names['appimage'] = f'{slug}-v{ver}-linux-x64.AppImage'
+        names['deb'] = f'{slug}-v{ver}-linux-x64.deb'
+        want += [names['appimage'], names['deb']]
+    missing = [n for n in want if n not in sizes]
+    if missing:
+        raise Fallo(f'a la Release {tag} le faltan: {", ".join(missing)}')
+    extras = [n for n in optional + ['SHA256SUMS.txt', 'linux-SHA256SUMS.txt', 'release-notes.json']
+              if n in sizes]
+    portable_name = next((n for n in optional if n in sizes), None)
+
+    dest = work / 'descargas' / slug
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    pattern_args = []
+    for n in want + extras:
+        pattern_args += ['-p', n]
+    gh('release', 'download', tag, '-R', repo, '-D', str(dest), *pattern_args)
+    for n in want + extras:
+        got = (dest / n).stat().st_size if (dest / n).exists() else None
+        if got != sizes[n]:
+            raise Fallo(f'{n}: descargado {got} bytes, la Release dice {sizes[n]}')
+    rep.check(slug, f'descargados {len(want) + len(extras)} ficheros, tamanos iguales a la Release')
+
+    sums = {}
+    for f in ('SHA256SUMS.txt', 'linux-SHA256SUMS.txt'):
+        if (dest / f).exists():
+            sums.update(parse_sums((dest / f).read_text(encoding='utf-8', errors='replace')))
+
+    entry = next((t for t in manifest.get('tools', []) if t.get('tool') == slug), None)
+    win_ver, win_prev = windows_current(entry)
+    lin_ver, lin_prev = linux_current(entry)
+    published_ref = {}
+    if win_prev and win_ver == ver:
+        published_ref[names.get('setup')] = win_prev.get('sha256')
+    if lin_prev and lin_ver == ver:
+        for a in lin_prev.get('assets') or []:
+            published_ref[os.path.basename(a.get('url') or '')] = a.get('sha256')
+
+    files = {}
+    for n in [x for x in want + ([portable_name] if portable_name else []) if not x.endswith('.sig')]:
+        digest = sha256(dest / n)
+        ref = sums.get(n) or published_ref.get(n)
+        if ref and ref.lower() != digest:
+            raise Fallo(f'{n}: SHA256 {digest[:12]}... no coincide con la referencia {ref[:12]}...')
+        if ref:
+            src = 'SHA256SUMS' if n in sums else 'manifest publicado'
+            rep.check(slug, f'{n}: SHA256 coincide con {src}')
+        files[n] = {'name': n, 'size': sizes[n], 'sha256': digest, 'path': str(dest / n), 'ref': bool(ref)}
+
+    plan = {'app': slug, 'repo': repo, 'version': ver, 'platforms': plats, 'tauri': tauri,
+            'release': rel, 'files': {}, 'latest': {}, 'windows_format': 'nsis' if tauri else 'inno'}
+
+    if 'windows' in plats:
+        signer = verify_authenticode(dest / names['setup'])
+        rep.check(slug, f'Authenticode del instalador valido (firmante {signer}, raiz de Microsoft)')
+        if tauri:
+            pubkey = conf.get('plugins', {}).get('updater', {}).get('pubkey')
+            if not pubkey:
+                raise Fallo('tauri.conf.json sin plugins.updater.pubkey')
+            verify_minisign(dest / names['setup'], dest / (names['setup'] + '.sig'), pubkey)
+            rep.check(slug, '.sig del actualizador verificado con la pubkey de tauri.conf.json')
+
+    # Notas
+    needed = [p for p in plats]
+    if slug in notes_override:
+        notes = check_notes(json.loads(Path(notes_override[slug]).read_text(encoding='utf-8')), needed)
+        rep.check(slug, f'notas de {notes_override[slug]} (solo en seco)')
+    elif (dest / 'release-notes.json').exists():
+        notes = check_notes(json.loads((dest / 'release-notes.json').read_text(encoding='utf-8')), needed)
+        rep.check(slug, 'notas en ingles de release-notes.json')
+    else:
+        notes = {}
+
+    # Windows
+    if 'windows' in plats:
+        setup = files[names['setup']]
+        portable = files.get(portable_name) if portable_name else None
+        state = platform_state(win_ver, (win_prev or {}).get('sha256'), ver, setup['sha256'], 'Windows')
+        if state == 'igual':
+            rep.check(slug, f'Windows {ver} ya publicado con estos mismos ficheros: no se vuelve a subir')
+            plan['windows_igual'] = True
+        else:
+            wnotes = notes.get('windows')
+            if not wnotes:
+                rep.fallaria(slug, 'la Release no trae release-notes.json con las notas de Windows')
+                wnotes = '[en seco: sin release-notes.json]'
+            plan['windows_block'] = windows_block(win_prev, slug, ver, setup, portable,
+                                                  plan['windows_format'], wnotes)
+            plan['files'][setup['name']] = setup
+            if portable:
+                plan['files'][portable['name']] = portable
+        plan['windows_notes'] = (plan.get('windows_block') or win_prev or {}).get('notes')
+        # *-latest.json: solo Tauri con endpoint propio en el dominio
+        if tauri:
+            sig_text = (dest / (names['setup'] + '.sig')).read_text(encoding='utf-8').strip()
+            for ep in conf.get('plugins', {}).get('updater', {}).get('endpoints') or []:
+                if ep.startswith(UPDATES_PREFIX) and ep.endswith('-latest.json') and '/' not in ep[len(UPDATES_PREFIX):]:
+                    plan['latest'][ep[len(UPDATES_PREFIX):]] = {
+                        'signature': sig_text, 'url': url_release(slug, ver, setup['name'])}
+            if not plan['latest']:
+                rep.check(slug, 'Tauri sin endpoint propio en el dominio: no hay *-latest.json que tocar')
+
+    # Linux
+    if 'linux' in plats:
+        appimage, deb = files[names['appimage']], files[names['deb']]
+        cur = None
+        if lin_prev:
+            cur = {os.path.basename(a.get('url') or ''): a.get('sha256') for a in lin_prev.get('assets') or []}
+            cur = (cur.get(names['appimage'], lin_prev.get('sha256')), cur.get(names['deb']))
+        state = platform_state(lin_ver, cur, ver, (appimage['sha256'], deb['sha256']), 'Linux')
+        if state == 'igual':
+            rep.check(slug, f'Linux {ver} ya publicado con estos mismos ficheros: no se vuelve a subir')
+        else:
+            lnotes = notes.get('linux')
+            if not lnotes:
+                rep.fallaria(slug, 'la Release no trae release-notes.json con las notas de Linux')
+                lnotes = '[en seco: sin release-notes.json]'
+            plan['linux_block'] = linux_block(lin_prev, slug, ver, appimage, deb, tauri, lnotes)
+            plan['files'][appimage['name']] = appimage
+            plan['files'][deb['name']] = deb
+
+    # Solo lo que se va a subir necesita referencia: sin ella no hay prueba de que es lo construido.
+    for n, f in plan['files'].items():
+        if not f['ref']:
+            rep.fallaria(slug, f'{n} sin SHA256 de referencia (ni SHA256SUMS en la Release ni manifest)')
+
+    if entry is None:
+        if 'windows_block' not in plan:
+            raise Fallo('app nueva en el manifest sin Windows en la tanda')
+        plan['display_name'] = display_name(central, slug)
+        branch = notes_url_branch or json.loads(gh('api', f'repos/{repo}').stdout).get('default_branch', 'main')
+        plan['notes_url'] = f'https://github.com/{repo}/blob/{branch}/CHANGELOG.md'
+        rep.check(slug, f"app nueva en el manifest: \"{plan['display_name']}\"")
+    else:
+        plan['display_name'] = entry.get('display_name')
+    return plan
+
+
+# ───────────────────────────── FTP ─────────────────────────────
+
+def ftp_connect(central):
+    import ftplib
+    c = json.loads((central / 'credentials.json').read_text(encoding='utf-8'))
+    ftp = ftplib.FTP_TLS(c['_ftp_host'], timeout=60)
+    ftp.login(c['_ftp_user'], c['_ftp_pass'])
+    ftp.prot_p()
+    ftp.set_pasv(True)
+    return ftp
+
+
+def ftp_read(ftp, path):
+    import io
+    buf = io.BytesIO()
+    ftp.retrbinary(f'RETR {path}', buf.write)
+    return buf.getvalue()
+
+
+def ftp_write(ftp, path, data):
+    import io
+    ftp.storbinary(f'STOR {path}', io.BytesIO(data))
+
+
+def verify_remote(central, slug, version, files, manifest_bytes, latest):
+    """Sesion FTP NUEVA: los binarios siguen ahi con su tamano (LIST + SIZE), el SHA256SUMS los
+    lista con su hash, y manifest.json y *-latest.json son byte a byte los locales."""
+    ftp = ftp_connect(central)
+    try:
+        folder = f'/releases/{slug}/v{version}'
+        listing = []
+        ftp.retrlines(f'LIST {folder}', listing.append)
+        ftp.voidcmd('TYPE I')
+        for name, f in files.items():
+            if not any(line.split(None, 8)[-1] == name for line in listing if line.strip()):
+                raise Fallo(f'LIST de {folder} no muestra {name}')
+            size = ftp.size(f'{folder}/{name}')
+            if size != f['size']:
+                raise Fallo(f'{folder}/{name}: {size} bytes en el FTP, {f["size"]} en local')
+        if files:
+            sums = parse_sums(ftp_read(ftp, f'{folder}/{slug}-v{version}-SHA256SUMS.txt').decode('utf-8'))
+            for name, f in files.items():
+                if sums.get(name) != f['sha256']:
+                    raise Fallo(f'{slug}-v{version}-SHA256SUMS.txt no lista {name} con su hash')
+        if manifest_bytes is not None and ftp_read(ftp, '/updates/manifest.json') != manifest_bytes:
+            raise Fallo('/updates/manifest.json del FTP no es el manifest local firmado')
+        for fname, data in latest.items():
+            if ftp_read(ftp, f'/updates/{fname}') != data:
+                raise Fallo(f'/updates/{fname} del FTP no es el local')
+        return len(listing)
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+
+DRY_WRAPPER = r'''
+import sys, urllib.parse
+scripts, endpoint = sys.argv[1], sys.argv[2]
+if urllib.parse.urlsplit(endpoint).hostname not in ("127.0.0.1", "localhost"):
+    raise SystemExit("en seco el sign-manifest tiene que ser local")
+sys.path.insert(0, scripts)
+import ftp_release
+ftp_release.SIGN_ENDPOINT = endpoint
+sys.argv = [ftp_release.__file__] + sys.argv[3:]
+ftp_release.main()
+'''
+
+
+def run_ftp_release(central, slug, version, paths, sign_endpoint, log):
+    """sign_endpoint: el del sign-manifest simulado (en seco) o None (el de verdad)."""
+    args = ['--fabrica', slug, version, *paths]
+    if sign_endpoint:
+        cmd = [sys.executable, '-c', DRY_WRAPPER, str(central / 'scripts'), sign_endpoint, *args]
+    else:
+        cmd = [sys.executable, str(central / 'scripts' / 'ftp_release.py'), *args]
+    env = dict(os.environ, PYTHONIOENCODING='utf-8')
+    run(cmd, cwd=str(central), env=env, log=log, label='ftp_release.py')
+
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+class Mock:
+    """FTPS y sign-manifest simulados (mock_servers.py) y credentials.json que apunta a ellos."""
+
+    def __init__(self, central, work):
+        self.central, self.work = central, work
+        self.root = work / 'ftp-simulado'
+        self.state = work / 'mock'
+        self.secret = secrets.token_hex(16)
+        self.user, self.password = 'dryrun', secrets.token_hex(12)
+        self.proc = None
+        self.sign_port = free_port()   # el FTP va en el 21 (ftp_release no deja elegir); la firma, en uno libre
+        self.sign_endpoint = f'http://127.0.0.1:{self.sign_port}/api/sign-manifest'
+
+    def start(self):
+        for d in (self.root, self.state):
+            if d.exists():
+                shutil.rmtree(d)
+        self.state.mkdir(parents=True)
+        (self.root / 'releases').mkdir(parents=True)   # audit_releases lista /releases aunque no se suba nada
+        log = open(self.state / 'mock.log', 'w', encoding='utf-8')
+        self.proc = subprocess.Popen(
+            [sys.executable, str(FACTORY / 'scripts' / 'mock_servers.py'), '--root', str(self.root),
+             '--state', str(self.state), '--user', self.user, '--password', self.password,
+             '--secret', self.secret, '--ftp-port', str(MOCK_FTP_PORT), '--sign-port', str(self.sign_port)],
+            stdout=log, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        for _ in range(100):
+            if (self.state / 'ready').exists():
+                break
+            if self.proc.poll() is not None:
+                raise Fallo(f'los servidores simulados no arrancan: {(self.state / "mock.log").read_text()[-400:]}')
+            time.sleep(0.2)
+        else:
+            raise Fallo('los servidores simulados no responden en 20 s')
+        write_json(self.central / 'credentials.json', {
+            '_ftp_host': '127.0.0.1', '_ftp_user': self.user, '_ftp_pass': self.password,
+            '_release_signing_secret': self.secret})
+
+    def seed(self, rel, data):
+        p = self.root / rel.lstrip('/')
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def sign_requests(self):
+        p = self.state / 'sign-requests.jsonl'
+        return [json.loads(x) for x in p.read_text(encoding='utf-8').splitlines()] if p.exists() else []
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        cred = self.central / 'credentials.json'
+        if cred.exists() and credentials_host(self.central) == '127.0.0.1':
+            cred.unlink()
+
+
+# ───────────────────────────── fase 2: publicar una app ─────────────────────────────
+
+def publish_app(plan, central, work, seco, rep, mock, today, now_iso):
+    slug, ver = plan['app'], plan['version']
+    manifest_path = central / 'updates' / 'manifest.json'
+    log = work / f'{slug}.log'
+    snapshot = manifest_path.read_bytes()
+    manifest = json.loads(snapshot)
+    validate_manifest = load_central_module(central, 'validate_manifest')
+
+    entry = apply_plan(manifest, plan, today)
+    errors = validate_manifest.validate_schema(entry)
+    if errors:
+        raise Fallo(f'esquema del manifest: {errors}')
+    new_bytes = dump_json(manifest).encode('utf-8')
+    changed_manifest = manifest != json.loads(snapshot)   # por contenido: el checkout puede venir en CRLF
+
+    uploaded = False
+    if plan['files']:
+        manifest_path.write_bytes(new_bytes)
+        sign_before = len(mock.sign_requests()) if mock else 0
+        try:
+            run_ftp_release(central, slug, ver, [f['path'] for f in plan['files'].values()],
+                            mock.sign_endpoint if seco else None, log)
+        except Fallo as e:
+            manifest_path.write_bytes(snapshot)
+            raise Fallo(f'ftp_release.py: {e} (manifest local restaurado; ver {log.name})')
+        uploaded = True
+        rep.app(slug, servidor=True)   # el manifest con esta app ya esta en el FTP
+        signed = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if not signed.get('sig') or signed['sig'] == json.loads(snapshot).get('sig'):
+            raise Fallo('ftp_release.py no dejo una firma nueva en el manifest')
+        if mock:
+            reqs = mock.sign_requests()[sign_before:]
+            payload = {k: v for k, v in signed.items() if k != 'sig'}
+            from mock_servers import dryrun_sig
+            if len(reqs) != 1 or not reqs[0]['secret_ok'] or reqs[0]['has_sig'] or signed['sig'] != dryrun_sig(payload):
+                raise Fallo(f'firma simulada inesperada: {reqs}')
+            rep.check(slug, 'manifest firmado (sign-manifest simulado: secreto enviado, sin "sig" en lo firmado, '
+                            'firma = la del contenido subido)')
+        else:
+            rep.check(slug, 'manifest firmado por sign-manifest')
+        rep.check(slug, f'ftp_release.py --fabrica: {len(plan["files"])} ficheros + SHA256SUMS + manifest '
+                        '(sin poda ni archivo)')
+    elif changed_manifest:
+        raise Fallo('el manifest cambia sin ficheros que subir (no deberia pasar)')
+
+    # *-latest.json (Tauri con endpoint propio)
+    latest_bytes = {}
+    for fname, info in plan['latest'].items():
+        path = central / 'updates' / fname
+        if plan.get('windows_igual') and path.exists():
+            cur = json.loads(path.read_text(encoding='utf-8'))
+            if cur.get('version') == ver and cur.get('platforms', {}).get('windows-x86_64', {}).get('signature') == info['signature']:
+                rep.check(slug, f'{fname} ya apunta a {ver}')
+                continue
+        data = dump_json(latest_json(ver, plan['windows_notes'], now_iso, info['signature'], info['url'])).encode('utf-8')
+        ftp = ftp_connect(central)
+        try:
+            ftp_write(ftp, f'/updates/{fname}', data)
+        finally:
+            ftp.quit()
+        path.write_bytes(data)          # solo lo que ya esta en el FTP llega a main
+        rep.app(slug, servidor=True)
+        latest_bytes[fname] = data
+        rep.check(slug, f'{fname} subido ({ver}, firma del .sig de la Release)')
+
+    if uploaded or latest_bytes:
+        n = verify_remote(central, slug, ver, plan['files'],
+                          manifest_path.read_bytes() if uploaded else None, latest_bytes)
+        rep.check(slug, f'sesion FTP nueva: LIST ({n} entradas) y SIZE de cada fichero, SHA256SUMS, '
+                        'manifest y latest iguales a los locales')
+
+    # Web: fallback de las fichas a medida y novedades
+    if 'windows' in plan['platforms']:
+        out = run([sys.executable, str(central / 'scripts' / 'sync_fallback_hrefs.py'), slug],
+                  cwd=str(central), log=log).stdout.strip()
+        rep.check(slug, f'sync_fallback_hrefs: {out.splitlines()[-1] if out else "sin salida"}')
+        published_today = plan.get('windows_block') or entry.get('release_date') == today
+        news = central / 'site' / 'news' / 'index.html'
+        if published_today and plan['windows_notes']:
+            text = news.read_bytes().decode('utf-8')
+            new = news_insert(text, entry['release_date'], plan['display_name'], ver, plan['windows_notes'], slug)
+            if new != text:
+                news.write_bytes(new.encode('utf-8'))
+                rep.check(slug, 'entrada nueva en site/news/index.html')
+            else:
+                rep.check(slug, 'site/news/index.html ya tenia esta version')
+        if downloads_hidden(central, slug):
+            rep.avisos.append(f'{slug} sigue en DOWNLOADS_HIDDEN de site/assets/catalog.js: sacarla '
+                              'es manual (decision de Javier) y no sale en /downloads/ hasta entonces')
+    rep.app(slug, estado='publicada' if (uploaded or latest_bytes) else 'ya publicada')
+
+
+# ───────────────────────────── fase 3 ─────────────────────────────
+
+def changed_paths(central):
+    out = git(central, 'status', '--porcelain', '--', 'updates', 'site').stdout
+    return [line[3:].strip().strip('"') for line in out.splitlines() if line.strip()]
+
+
+def commit(central, apps_done, partial):
+    paths = changed_paths(central)
+    if not paths:
+        return None
+    if any(Path(p).name == 'credentials.json' for p in paths):
+        raise Fallo('credentials.json aparece entre los cambios: no se commitea')
+    git(central, 'add', '--', *paths)
+    what = ', '.join(f"{p['app']} v{p['version']} ({' y '.join(p['platforms'])})" for p in apps_done)
+    msg = (f'release: {what} desde la fabrica'
+           + (' (PARCIAL: la publicacion se paro, ver el resumen del run)' if partial else '')
+           + ' (S-1069)\n\nmanifest firmado, *-latest.json, fallback de las fichas y novedades. '
+             'Publicado por tsp-release-factory/publish.yml.')
+    git(central, '-c', 'user.name=tsp-release-factory',
+        '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-q', '-m', msg)
+    return paths
+
+
+def push(central, base, rep):
+    p = git_auth(central, 'push', 'origin', 'HEAD:main', check=False)
+    if p.returncode == 0:
+        return
+    git_auth(central, 'fetch', 'origin', 'main')
+    upstream_manifest = git(central, 'diff', '--quiet', base, 'FETCH_HEAD', '--', 'updates/manifest.json',
+                            check=False).returncode != 0
+    r = git(central, 'rebase', 'FETCH_HEAD', check=False)
+    if r.returncode != 0:
+        git(central, 'rebase', '--abort', check=False)
+        raise Fallo('el push a main se rechazo y el rebase choca: hay que subir el commit a mano '
+                    '(el parche va en los artefactos del run)')
+    if upstream_manifest:
+        rep.avisos.append('CRITICO: otra sesion cambio updates/manifest.json en main mientras se publicaba; '
+                          'el manifest del FTP no lleva ese cambio: hay que volver a firmarlo y subirlo')
+    git_auth(central, 'push', 'origin', 'HEAD:main')
+
+
+def seed_site_manifest(central, mock):
+    deploy_site = load_central_module(central, 'deploy_site')
+    files = deploy_site.collect_local_files(str(central / 'site'))
+    data = json.dumps({k: v[1] for k, v in files.items()}, ensure_ascii=False, indent=2).encode('utf-8')
+    mock.seed('/site-manifest.json', data)
+
+
+def http_json(url):
+    req = urllib.request.Request(url, headers={'User-Agent': 'tsp-release-factory/1.0', 'Cache-Control': 'no-cache'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+# ───────────────────────────── resumen ─────────────────────────────
+
+def write_summary(rep, plans, args, t0, md_path, json_path):
+    elapsed = (time.time() - t0) / 60
+    job_min = (time.time() - args.inicio_job) / 60 if args.inicio_job else None
+    lines = [f"## Publicacion {'EN SECO' if rep.seco else 'REAL'}", '']
+    lines.append(f'Llego hasta: **{rep.hasta}**. publish.py: {elapsed:.1f} min'
+                 + (f'; job hasta aqui: {job_min:.1f} min (~{int(job_min) + 1} facturables de Linux)' if job_min else ''))
+    lines += ['', '| Paso | Estado | Detalle |', '|---|---|---|']
+    lines += [f'| {p} | {e} | {d} |' for p, e, d in rep.pasos]
+    result = {'modo': 'seco' if rep.seco else 'real', 'hasta': rep.hasta, 'minutos_publish': round(elapsed, 1),
+              'minutos_job': round(job_min, 1) if job_min else None, 'apps': [], 'avisos': rep.avisos,
+              'en_real_fallaria': rep.real_fallaria}
+    for slug, a in rep.apps.items():
+        plan = plans.get(slug, {})
+        lines += ['', f"### {slug} {plan.get('version', '')}: {a['estado']}"]
+        if a.get('motivo'):
+            lines.append(f"**Motivo:** {a['motivo']}")
+        lines += [f'- {c}' for c in a['comprobaciones']]
+        ficheros = [{'nombre': f['name'], 'bytes': f['size'], 'mb': round(f['size'] / 1048576, 1),
+                     'url': url_release(slug, plan['version'], f['name'])} for f in plan.get('files', {}).values()]
+        if ficheros:
+            lines.append('')
+            lines += [f"- [{f['nombre']}]({f['url']}): {f['mb']} MB" for f in ficheros]
+        result['apps'].append({'app': slug, 'version': plan.get('version'), 'plataformas': plan.get('platforms'),
+                               'estado': a['estado'], 'motivo': a.get('motivo'), 'ficheros': ficheros,
+                               'latest': list(plan.get('latest', {})), 'release_final': a.get('release_final', False)})
+    if rep.avisos:
+        lines += ['', '### Avisos'] + [f'- {x}' for x in rep.avisos]
+    if rep.real_fallaria:
+        lines += ['', '### En real esto pararia la publicacion'] + [f'- {x}' for x in rep.real_fallaria]
+    tg = [f"{'[EN SECO] ' if rep.seco else ''}Publicacion de la tanda: {rep.hasta}"]
+    for a in result['apps']:
+        mb = sum(f['mb'] for f in a['ficheros'])
+        tg.append(f"- {a['app']} {a['version'] or ''}: {a['estado']}"
+                  + (f" ({len(a['ficheros'])} ficheros, {mb:.0f} MB)" if a['ficheros'] else '')
+                  + (f" — {a['motivo']}" if a['motivo'] else ''))
+    tg += [f'Aviso: {x}' for x in rep.avisos]
+    tg.append(f"{elapsed:.0f} min" + (f" (job ~{int(job_min) + 1} min)" if job_min else ''))
+    result['telegram'] = '\n'.join(tg)
+    if md_path:
+        Path(md_path).write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    if json_path:
+        Path(json_path).write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    print('\n'.join(lines))
+
+
+# ───────────────────────────── main ─────────────────────────────
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--central', required=True)
+    ap.add_argument('--work', required=True)
+    ap.add_argument('--apps', required=True)
+    ap.add_argument('--publicar', action='store_true', help='publica de verdad (sin esto, en seco)')
+    ap.add_argument('--resumen')
+    ap.add_argument('--resultado')
+    ap.add_argument('--inicio-job', type=float)
+    ap.add_argument('--notas', action='append')
+    ap.add_argument('--entrada-previa', action='append')
+    args = ap.parse_args(argv)
+    t0 = time.time()
+    seco = not args.publicar
+    rep = Informe(seco)
+    central = Path(args.central).resolve()
+    work = Path(args.work).resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    plans, done, mock = {}, [], None
+    try:
+        apps = parse_apps(args.apps)
+        notes_override = parse_pairs(args.notas, '--notas')
+        previous = parse_pairs(args.entrada_previa, '--entrada-previa')
+        if not seco and (notes_override or previous):
+            raise Fallo('--notas y --entrada-previa son solo para el modo en seco')
+        host = credentials_host(central)
+        if seco and host not in (None, '127.0.0.1'):
+            raise Fallo('en seco no se usa un checkout con credentials.json real: usa un clon aparte')
+        if not seco and host in (None, '127.0.0.1'):
+            raise Fallo('falta credentials.json con el FTP real en el checkout del central')
+        if git(central, 'status', '--porcelain', '--', 'updates', 'site').stdout.strip():
+            raise Fallo('el checkout del central tiene cambios sin commitear en updates/ o site/')
+        base = git(central, 'rev-parse', 'HEAD').stdout.strip()
+        rep.paso('1. Entradas', 'ok', f"{len(apps)} app(s); central en {base[:8]}")
+
+        manifest_path = central / 'updates' / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        for slug, rev in previous.items():
+            old = json.loads(git(central, 'show', f'{rev}:updates/manifest.json').stdout)
+            old_entry = next(t for t in old['tools'] if t['tool'] == slug)
+            manifest['tools'] = [old_entry if t['tool'] == slug else t for t in manifest['tools']]
+            write_json(manifest_path, manifest)
+            git(central, '-c', 'user.name=dry-run', '-c', 'user.email=dry-run@localhost', 'commit', '-q',
+                '-m', f'[en seco] {slug} como en {rev}', '--', 'updates/manifest.json')
+            base = git(central, 'rev-parse', 'HEAD').stdout.strip()
+            rep.check(slug, f'(en seco) entrada de partida del manifest = la de {rev}')
+
+        for spec in apps:
+            try:
+                plans[spec['app']] = prepare(spec, manifest, central, work, rep, notes_override)
+                rep.app(spec['app'], estado='lista')
+            except Fallo as e:
+                rep.app(spec['app'], estado='excluida', motivo=str(e))
+                print(f"  [{spec['app']}] EXCLUIDA: {e}", flush=True)
+        if not plans:
+            raise Fallo('ninguna app de la tanda paso las comprobaciones')
+        rep.paso('2-3. Descarga, comprobaciones y plan del manifest', 'ok',
+                 f"{len(plans)} lista(s), {len(apps) - len(plans)} excluida(s)")
+
+        if seco:
+            mock = Mock(central, work)
+            mock.start()
+            mock.seed('/updates/manifest.json', manifest_path.read_bytes())
+            seed_site_manifest(central, mock)
+            sys.path.insert(0, str(FACTORY / 'scripts'))
+        # Nadie ha tocado main desde el checkout: si no, se publicaria un manifest sin su cambio.
+        git_auth(central, 'fetch', '-q', 'origin', 'main')
+        remote = git(central, 'rev-parse', 'FETCH_HEAD').stdout.strip()
+        if remote != base and not previous:
+            raise Fallo(f'main se movio desde el checkout ({base[:8]} -> {remote[:8]}): relanza la publicacion')
+
+        today = utc_now().strftime('%Y-%m-%d')
+        now_iso = utc_now().strftime('%Y-%m-%dT%H:%M:%SZ')
+        for slug, plan in plans.items():
+            try:
+                publish_app(plan, central, work, seco, rep, mock, today, now_iso)
+                done.append(plan)
+            except Fallo as e:
+                rep.app(slug, estado='fallo', motivo=str(e))
+                raise Fallo(f'{slug}: {e}')
+        rep.paso('4-6a. FTP, firma, latest, fichas y novedades', 'ok',
+                 f"{len(done)} app(s){' contra el FTP simulado' if seco else ''}")
+    except Fallo as e:
+        rep.paso('PARADA', 'fallo', str(e))
+        live = [plans[s] for s, a in rep.apps.items() if a.get('servidor') and s in plans]
+        if live:
+            # Lo que ya esta en el FTP tiene que quedar en main: si no, la siguiente subida del
+            # manifest (desde cualquier sitio) lo revertiria en silencio. La web no se toca.
+            git(central, 'restore', '--', 'site', check=False)
+            try:
+                commit(central, live, partial=True)
+                if not seco:
+                    push(central, base, rep)
+                rep.paso('Rescate', 'ok', 'manifest y *-latest.json ya publicados quedan en main; web sin desplegar')
+            except Fallo as e2:
+                rep.paso('Rescate', 'fallo', f'{e2}: el FTP y main NO coinciden, hay que subir el commit a mano')
+        finish(rep, plans, args, t0, mock, central, work)
+        return 1
+
+    try:
+        paths = commit(central, done, partial=False)
+        if paths is None:
+            rep.paso('6b. Commit', 'ok', 'nada que commitear (todo estaba publicado)')
+        else:
+            (work / 'publish.diff').write_text(git(central, 'diff', base, 'HEAD').stdout, encoding='utf-8')
+            stat = git(central, 'diff', '--stat', base, 'HEAD').stdout.strip().splitlines()[-1]
+            if seco:
+                rep.paso('6b. Commit', 'ok', f'local, sin push (en seco): {stat}; diff en publish.diff')
+            else:
+                push(central, base, rep)
+                rep.paso('6b. Commit y push a main', 'ok', stat)
+
+        # Deploy de site/ desde el commit de main, nunca desde un disco con trabajo ajeno
+        if seco:
+            out = run([sys.executable, str(central / 'scripts' / 'deploy_site.py'), '--dry-run'],
+                      cwd=str(central), log=work / 'deploy.log').stdout
+            m = re.search(r'(\d+) ficheros a subir', out)
+            listed = re.findall(r'^\s+(/\S+)\s+\(', out.split('[DRY-RUN] Ficheros que se subir', 1)[-1], re.M)
+            rep.paso('6c. deploy_site.py --dry-run', 'ok',
+                     f"{m.group(1) if m else '?'} fichero(s) a subir frente al FTP simulado (= main sin la tanda): "
+                     + ', '.join(listed[:8]))
+        else:
+            head = git(central, 'rev-parse', 'HEAD').stdout.strip()
+            git_auth(central, 'fetch', '-q', 'origin', 'main')
+            if git(central, 'rev-parse', 'FETCH_HEAD').stdout.strip() != head:
+                raise Fallo('HEAD no es origin/main tras el push: no se despliega')
+            env = dict(os.environ, DEPLOY_ORIGEN='la fábrica de releases', PYTHONIOENCODING='utf-8')
+            run([sys.executable, str(central / 'scripts' / 'deploy_site.py')], cwd=str(central), env=env,
+                log=work / 'deploy.log')
+            rep.paso('6c. deploy_site.py', 'ok', f'desde main {head[:8]}')
+
+        # Puerta
+        audit = run([sys.executable, str(central / 'scripts' / 'audit_releases.py'), '--quick', '--sin-respaldo'],
+                    cwd=str(central), log=work / 'audit.log', check=False)
+        if audit.returncode != 0:
+            problems = [l.strip() for l in audit.stdout.splitlines() if l.strip().startswith('- ')]
+            raise Fallo('audit_releases.py --quick --sin-respaldo: ' + '; '.join(problems[:6]))
+        detail = 'audit_releases --quick --sin-respaldo OK'
+        if seco:
+            detail += ' (contra el FTP simulado; validate_manifest y latest en vivo no se pueden comprobar en seco)'
+        else:
+            for plan in done:
+                run([sys.executable, str(central / 'scripts' / 'validate_manifest.py'), '--no-update', '--slug',
+                     plan['app']], cwd=str(central), log=work / 'audit.log')
+                for fname in plan['latest']:
+                    live = http_json(f'{UPDATES_PREFIX}{fname}?nocache={int(time.time())}')
+                    if live.get('version') != plan['version']:
+                        raise Fallo(f'{UPDATES_PREFIX}{fname} sirve {live.get("version")}, no {plan["version"]}')
+            detail += '; validate_manifest --slug (HEAD y tamano en vivo) y *-latest.json en vivo OK'
+        rep.paso('6d. Puerta', 'ok', detail)
+
+        for plan in done:
+            rel = plan['release']
+            if not rel.get('isPrerelease'):
+                continue
+            cmd = ['release', 'edit', f"v{plan['version']}", '-R', plan['repo'], '--prerelease=false', '--latest']
+            if seco:
+                rep.check(plan['app'], f"(en seco) se haria: gh {' '.join(cmd)}")
+            else:
+                gh(*cmd)
+                rep.app(plan['app'], release_final=True)
+                rep.check(plan['app'], 'Release pasada a definitiva')
+        rep.paso('7. Release definitiva', 'ok', 'en seco: no se toca' if seco else '')
+    except Fallo as e:
+        rep.paso('PARADA', 'fallo', f'{e} (FTP y main ya publicados; lo que falta, a mano)')
+        finish(rep, plans, args, t0, mock, central, work)
+        return 1
+    finish(rep, plans, args, t0, mock, central, work)
+    bad = [a for a in rep.apps.values() if a['estado'] in ('excluida', 'fallo')]
+    return 1 if rep.real_fallaria or bad else 0
+
+
+def finish(rep, plans, args, t0, mock, central, work):
+    if mock:
+        mock.stop()
+    write_summary(rep, plans, args, t0, args.resumen, args.resultado)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

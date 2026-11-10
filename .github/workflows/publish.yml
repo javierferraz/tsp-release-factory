@@ -1,0 +1,167 @@
+name: Publish
+
+# Convierte las Releases ya preparadas de una tanda de apps (instalador firmado, .sig del
+# actualizador de Tauri, SHA256SUMS, AppImage y .deb que dejan los build-*) en una publicacion
+# completa, con el mismo resultado que el flujo manual (tsp-create-dist §3 y tsp-linux-build
+# §5): manifest firmado en el FTP, binarios en /releases/, *-latest.json de Tauri, fallback de
+# las fichas, novedades, commit y push del manifest en main, deploy de site/ desde main,
+# audit_releases como puerta y la Release de prerelease a definitiva. Paquete R6 de
+# docs/distribucion/releases-automaticas.md (repo central, S-1069). Todo lo hace
+# scripts/publish.py; este fichero solo prepara el runner.
+#
+# EN SECO por defecto (dry_run: true): FTP y sign-manifest simulados en 127.0.0.1
+# (scripts/mock_servers.py), sin push, sin deploy real y sin tocar la Release. Ni el FTP ni
+# el secreto de firma llegan a ese paso. Lo que falta para que fuera de verdad sale en el
+# resumen como «En real esto pararia la publicacion».
+#
+# Lo que NO hace (sigue siendo del portatil, con D: conectado): podar el FTP, archivar en
+# D:/releases-archive y la pestaña de Sheets. Tampoco saca una app de DOWNLOADS_HIDDEN
+# (decision de Javier): lo avisa.
+#
+# Solo se dispara a mano (o desde el «si» de la tanda, R8):
+#   gh workflow run publish.yml -R javierferraz/tsp-release-factory \
+#     -f apps='[{"app":"bright-cardinal","repo":"javierferraz/2610-bright-cardinal","version":"1.0.0","platforms":["windows","linux"]}]'
+# De verdad, ademas: -f dry_run=false
+
+run-name: Publish ${{ inputs.dry_run && '(en seco)' || '(REAL)' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: 'Tanda en JSON: [{"app","repo","version","platforms":["windows","linux"]}]'
+        required: true
+        type: string
+      dry_run:
+        description: En seco (FTP y firma simulados; no publica nada)
+        required: false
+        type: boolean
+        default: true
+
+# El GITHUB_TOKEN no se usa: el central y los repos de las apps van con APPS_TOKEN.
+permissions:
+  contents: read
+
+# Una sola publicacion a la vez, en seco o no: dos a la vez se pisarian el manifest.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Doble cerrojo: solo workflow_dispatch y solo con el workflow de main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Las entradas se usan siempre por variable de entorno, nunca interpoladas en el script.
+      APPS: ${{ inputs.apps }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      CENTRAL_REPO: javierferraz/2606-thestromboliproject
+    steps:
+      - name: Inicio
+        run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+          echo "WORK=$RUNNER_TEMP/publish" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/publish"
+          [ "$DRY_RUN" = true ] || [ "$DRY_RUN" = false ] || { echo "::error::dry_run no valido: '$DRY_RUN'"; exit 1; }
+
+      - name: Acceso al central con APPS_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+        run: |
+          gh api "repos/$CENTRAL_REPO" --jq .full_name > /dev/null 2>&1 || { echo "::error::APPS_TOKEN no puede leer $CENTRAL_REPO (token vacio, caducado o sin ese repo): sin el no hay manifest que publicar"; exit 1; }
+
+      - name: Fines de linea tal cual
+        run: git config --global core.autocrlf false
+
+      - name: Checkout de la fabrica
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: factory
+          persist-credentials: false
+
+      - name: Checkout del central (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: javierferraz/2606-thestromboliproject
+          ref: main
+          token: ${{ secrets.APPS_TOKEN }}
+          path: central
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Dependencias
+        run: python -m pip install --disable-pip-version-check -q -r factory/config/publish-requirements.txt
+
+      # El FTPS simulado escucha en 127.0.0.1:21 porque ftp_release.py no deja elegir puerto.
+      - name: Puertos bajos sin root (FTP simulado)
+        run: sudo sysctl -q -w net.ipv4.ip_unprivileged_port_start=21
+
+      - name: Tests de publish.py
+        env:
+          TSP_CENTRAL: ${{ github.workspace }}/central
+        run: python -m pytest factory/tests/test_publish.py -q -p no:cacheprovider
+
+      - name: Publicar
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          PYTHONIOENCODING: utf-8
+          # Los secretos del FTP y de la firma solo existen en este paso, y solo de verdad.
+          FTP_HOST: ${{ !inputs.dry_run && secrets.FTP_HOST || '' }}
+          FTP_USER: ${{ !inputs.dry_run && secrets.FTP_USER || '' }}
+          FTP_PASS: ${{ !inputs.dry_run && secrets.FTP_PASS || '' }}
+          SIGNING_SECRET: ${{ !inputs.dry_run && secrets.RELEASE_SIGNING_SECRET || '' }}
+        run: |
+          trap 'rm -f central/credentials.json' EXIT
+          args=(--central central --work "$WORK" --apps "$APPS" --inicio-job "$JOB_START"
+                --resumen "$WORK/resumen.md" --resultado "$WORK/resultado.json")
+          if [ "$DRY_RUN" = false ]; then
+            for v in FTP_HOST FTP_USER FTP_PASS SIGNING_SECRET; do
+              [ -n "${!v}" ] || { echo "::error::falta el secreto de $v: no se publica"; exit 1; }
+            done
+            python - <<'PY'
+          import json, os
+          fd = os.open("central/credentials.json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "w") as f:
+              json.dump({"_ftp_host": os.environ["FTP_HOST"], "_ftp_user": os.environ["FTP_USER"],
+                         "_ftp_pass": os.environ["FTP_PASS"],
+                         "_release_signing_secret": os.environ["SIGNING_SECRET"]}, f)
+          PY
+            args+=(--publicar)
+          fi
+          python factory/scripts/publish.py "${args[@]}"
+
+      - name: Resumen
+        if: always()
+        run: |
+          if [ -f "$WORK/resumen.md" ]; then
+            cat "$WORK/resumen.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish.py no llego a escribir el resumen: mira el log del paso Publicar." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Lo que sirve para revisar o rehacer a mano: resumen, JSON para Telegram, diff del
+      # central y logs. Ni los binarios descargados ni el FTP simulado.
+      - name: Artefactos
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publish-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/publish/resumen.md
+            ${{ runner.temp }}/publish/resultado.json
+            ${{ runner.temp }}/publish/publish.diff
+            ${{ runner.temp }}/publish/*.log
+            ${{ runner.temp }}/publish/mock/mock.log
+            ${{ runner.temp }}/publish/mock/sign-requests.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
