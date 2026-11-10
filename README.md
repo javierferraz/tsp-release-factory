@@ -96,6 +96,76 @@ doble): si el primero falla, el de Windows ni arranca.
 
 No genera el `portable.zip` que algunas releases publicaron a mano.
 
+## `build-tauri-linux.yml` — AppImage y `.deb` de una app Tauri (R5)
+
+```
+gh workflow run build-tauri-linux.yml -R javierferraz/tsp-release-factory -f app=bright-cardinal -f repo=javierferraz/2610-bright-cardinal -f tag=v1.0.0
+```
+
+Mismas entradas y mismas reglas que los de Windows. Un job en `ubuntu-24.04` (fijo: con
+`ubuntu-latest` sale glibc 2.43 y no arranca en Ubuntu 24.04 ni Mint 22, S-930):
+
+1. Valida las entradas; comprueba que el token ve el repo y que la Release `<tag>` no tiene ya
+   el AppImage, el `.deb` ni `linux-SHA256SUMS.txt` (**no pisa nada**).
+2. Saca la app en el tag y comprueba que `tauri.conf.json` y `package.json` llevan la versión del
+   tag y que existe `src-tauri/tauri.linux.conf.json` (targets `appimage` y `deb`).
+3. Dependencias del sistema (las del `linux-build.yml` de las apps, `patchelf` incluido), Node 22,
+   Rust estable y caché de Rust por app.
+4. **Tests de la app, aquí y una sola vez:** `npm test` (si la app tiene ese script; Chicken, Lion
+   y Tiger no lo tienen) y `cargo test --lib`, que además prueba la capa `platform/linux.rs`.
+5. `tauri build --bundles appimage deb` sin ficheros del actualizador (`createUpdaterArtifacts`
+   a `false` por `--config`, sin tocar el repo: Linux no los usa y no hace falta la clave).
+6. Artefactos filtrados por `_<versión>_` (incidente Clever Cat 1.3.6), renombrados a
+   `<slug>-v<X.Y.Z>-linux-x64.{AppImage,deb}`; el `.deb` declara esa versión y `amd64`.
+7. Abre el AppImage (`--appimage-extract`) y el `.deb` (`dpkg-deb -x`) y comprueba con `objdump -T`
+   que **ningún** binario que se entrega pide glibc > 2.39 (los workflows de las apps solo miraban
+   el ejecutable o el AppDir), y que el runtime del AppImage no enlaza `libfuse` (sin el runtime
+   estático no arranca sin `libfuse2`). SHA256 en `linux-SHA256SUMS.txt` (formato `sha256sum`).
+8. Sube los tres ficheros a la Release `<tag>` sin `--clobber`; si no existe, la crea como
+   prerelease, y si el job de Windows la crea a la vez, sigue con la suya.
+
+Sirve para las 6 Tauri con `linux-build.yml` (Cat, Chicken, Lion, Tiger, Cardinal, Greenjay) y
+para Parrot y Bluejay, que no lo tienen pero sí `tauri.linux.conf.json`: el build es el mismo que
+hacen los `build-<slug>.sh` (`npm install` + `tauri build` + copiar por versión). No pasa el
+`check-farewell.py` del central (tsp-linux-build §3.0); tampoco lo pasan los de Windows.
+
+## `build-pyside-linux.yml` — AppImage y `.deb` de una app PySide6 (R5)
+
+```
+gh workflow run build-pyside-linux.yml -R javierferraz/tsp-release-factory -f app=snappy-wasp -f repo=javierferraz/2606-snappy-wasp -f tag=v1.6.2
+```
+
+Las 7 PySide6 con `linux-build.yml` (Wasp, Beaver, Raccoon, Frog, Tappy, Ant, Bison) construyen
+igual: `packaging/linux/build-appimage.sh` (PyInstaller onedir, AppDir, `appimagetool`) y
+`build-packages.sh` (`fpm`), con `__version__` en `utils/version.py`. La fábrica ejecuta esos
+scripts del repo de la app y pone alrededor lo mismo que en Tauri: validación, Release sin esos
+ficheros, versión del `.deb` (`X.Y.Z-1` por la iteración de fpm), glibc ≤ 2.39 en todo lo que se
+entrega, runtime del AppImage sin `libfuse`, SHA256 y subida sin pisar.
+
+- **Python y PyInstaller:** si `requirements-build.txt` declara `Interprete: CPython X.Y.Z` y fija
+  `pyinstaller`, se usan esos (los mismos que en Windows y que en el pytest de Linux); si no,
+  Python 3.12 y la última PyInstaller, como los `linux-build.yml` de las apps. Hoy solo Wasp los
+  declara (CPython 3.11.9; su `linux-build.yml` usaba 3.12).
+- **fpm 1.18.0 fijado** (las apps instalaban el último).
+- **Paquetes de apt extra por app** en `config/linux-apt-extra.txt`: Bison y Ant instalaban los de
+  Qt offscreen y PulseAudio para sus tests; se mantienen para que PyInstaller empaquete lo mismo
+  que antes, y las demás no los llevan para no cambiar su bundle.
+- **No pasa pytest:** en la tanda lo pasa una vez el job `checks` de `build-pyside-windows.yml`,
+  que ya corre en Linux. Lanzado solo, este workflow no prueba nada de la app.
+
+Sneaky Spider no entra todavía: su versión está en `config.py` (`APP_VERSION`), no en
+`utils/version.py` (tampoco entra en `build-pyside-windows`). Orderly Owl sí cumple el contrato
+aunque no tenga `linux-build.yml`. Crafty Fox no tiene `packaging/linux/`.
+
+## Dónde corre cada test
+
+Cada test, una sola vez por tanda y en Linux (la mitad de precio que Windows):
+
+| Stack | Tests | Los pasa | Comentario |
+|---|---|---|---|
+| Tauri | `npm test`, `cargo test --lib` | `build-tauri-linux` | **Hoy también `build-tauri-windows`.** Propuesta: quitar de ese job los pasos «Tests (npm test)» y «Tests de Rust (cargo test --lib)» (el `npm run build` lo hace ya `tauri build`); ahorra unos 5 min de Windows ≈ 10 facturables por app. Requiere que la tanda lance siempre los dos workflows. Sin aplicar: el fichero es de R4. |
+| PySide6 | `pytest` | job `checks` de `build-pyside-windows` (Linux), o su job de Windows para las de `config/tests-en-windows.txt` | `build-pyside-linux` no los repite. |
+
 ## Coste medido
 
 GitHub factura cada job redondeando al minuto, y los de Windows cuentan doble. La API de
@@ -106,6 +176,27 @@ GitHub factura cada job redondeando al minuto, y los de Windows cuentan doble. L
 | `build-tauri-windows` | Bright Cardinal 1.0.0 | 41341539373 | build (Windows) | 18 min 2 s | ~38 |
 | `build-pyside-windows` | Snappy Wasp 1.6.2 | 41360434848 | checks (ubuntu-24.04) | 10 s | 1 |
 | | | | windows (con pytest, caché de pip caliente) | 3 min 21 s | 8 |
+| `build-tauri-linux` | Bright Cardinal 1.0.0 | 42912725701 | build (ubuntu-24.04, con npm test y cargo test) | 18 min 43 s | 19 |
+| `build-pyside-linux` | Snappy Wasp 1.6.2 | 41408254413 | build (ubuntu-24.04, sin pytest) | 2 min 31 s | 3 |
+
+En el de Bright Cardinal: `tauri build` 11 min 33 s, `cargo test --lib` 4 min 35 s (perfil
+`test`, aparte del `release`), `npm test` 37 s, apt 33 s, guardar la caché de Rust 1 min; la
+caché (segunda pasada) apenas acorta. Quitar los tests del job de Windows (ver «Dónde corre cada
+test») compensa con creces: unos 5 min de Windows son ~10 facturables y aquí cuestan ~5.
+
+Pilotos comparados con lo publicado (2026-11-02 y 2026-11-10; tag `-factory-test` en el mismo
+commit, Release de prueba borrada después):
+
+- **Bright Cardinal:** AppImage 104,04 MB frente a 104,05 MB, mismos 605 ficheros; `.deb`
+  16,59 MB con los mismos 5 ficheros; glibc más alta 2.39 en los dos. Solo cambian el `.desktop`
+  (`Categories=Office;` y `%F`) y el binario por unos bytes: el AppImage y el `.deb` de la Release
+  `v1.0.0` se reconstruyeron el 2026-11-05 desde `main` con S-1116, después del tag. La primera
+  pasada salió sin 9 ficheros de GStreamer (`gstreamer1.0-x` y `-gl`) por instalar con
+  `--no-install-recommends`; corregido (run 41407709372 → 42912725701).
+- **Snappy Wasp:** AppImage 90,7 MB frente a 93,6 MB, `.deb` 97,8 frente a 101,2 MB; mismos
+  ficheros salvo los nombres y los módulos de la biblioteca estándar de Python, porque la
+  fábrica usa el CPython 3.11.9 de `requirements-build.txt` y el `linux-build.yml` de la app
+  usaba 3.12. glibc más alta 2.38 en los dos.
 
 En el de Snappy Wasp el job de Windows se reparte así: PyInstaller y firma del `.exe` 44 s,
 ISCC con las tres firmas 39 s, smoke 26 s, pytest 18 s, entorno del build 17 s, el resto
@@ -134,6 +225,9 @@ Añadir una app Tauri nueva = darle acceso a `APPS_TOKEN` sobre su repo y grabar
 Añadir una app PySide6 nueva = darle acceso a `APPS_TOKEN` sobre su repo (no tiene clave propia)
 y que el repo cumpla lo que lista la cabecera de `build-pyside-windows.yml`; si sus tests no
 corren en Linux, una línea con su slug y el motivo en `config/tests-en-windows.txt`.
+
+Los dos workflows de Linux solo usan `APPS_TOKEN`: nada se firma (el manifest de Linux lleva
+solo SHA256 y no hay `.sig` del actualizador).
 
 ## Seguridad
 
