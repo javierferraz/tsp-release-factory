@@ -126,11 +126,14 @@ jobs:
           echo "| Version | tauri.conf.json y package.json = $VERSION; commit $(git rev-parse --short HEAD) |" >> "$GITHUB_STEP_SUMMARY"
 
       # Las mismas que el linux-build.yml de las apps. patchelf: sin el, el AppImage se queda
-      # colgado en el splash (tsp-linux-build §4.2).
+      # colgado en el splash (tsp-linux-build §4.2). Con sus Recommends, como en las apps:
+      # bundleMediaFramework empaqueta los plugins de GStreamer que haya en el runner, y con
+      # --no-install-recommends faltaban gstreamer1.0-x y -gl (ximagesink, xvimagesink, pango,
+      # opengl; piloto del 2026-11-02).
       - name: Prerrequisitos del sistema
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils gstreamer1.0-plugins-base gstreamer1.0-plugins-good libasound2-dev
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils gstreamer1.0-plugins-base gstreamer1.0-plugins-good libasound2-dev
 
       - name: Node 22
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
