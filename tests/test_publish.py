@@ -184,13 +184,13 @@ def test_display_name_y_downloads_hidden(tmp_path):
         publish.display_name(tmp_path, 'no-existe')
 
 
-# ── Authenticode (osslsigncode 2.8) ──
-# Salida armada con los printf de osslsigncode.c del tag 2.8 (verify_signature, print_cert y
-# main): en Windows no hay osslsigncode; el run de publish.yml la ejecuta de verdad.
+# ── Authenticode (osslsigncode 2.9) ──
+# Salida armada con los printf de osslsigncode.c del tag 2.9 (verify_signature, verify_authenticode,
+# print_cert y main): en Windows no hay osslsigncode; el run de publish.yml la ejecuta de verdad.
 
 def ossl_out(subject='/C=ES/ST=Zaragoza/L=Zaragoza/O=Francisco Javier Ferraz Rives/CN=Francisco Javier Ferraz Rives',
              sig='ok', n=1, final='Succeeded'):
-    """Como sale con -ignore-timestamp -time (el sello se verifica aparte con openssl)."""
+    """Como sale con -ignore-timestamp -time -ignore-crl (el sello se verifica aparte con openssl)."""
     block = ("\nSignature Index: 0  (Primary Signature)\n\n"
              "Message digest algorithm  : SHA256\nCurrent message digest    : AB\nCalculated message digest : AB\n\n"
              "Signer's certificate:\n\t------------------\n\tSigner #0:\n"
@@ -199,6 +199,7 @@ def ossl_out(subject='/C=ES/ST=Zaragoza/L=Zaragoza/O=Francisco Javier Ferraz Riv
              "\t\t\tnotAfter : Oct 31 03:19:15 2026 GMT\n\nCAfile: ms-root.pem\n\n"
              "Timestamp Server Signature verification is disabled\n"
              "Signature verification time: Oct 29 13:24:41 2026 GMT\n"
+             "Signing certificate chain verified using:\nCRL online verification disabled\n"
              f"Signature verification: {sig}\n\n")
     return f"PE checksum   : 00C72808\n{block}Number of verified signatures: {n}\n{final}\n"
 

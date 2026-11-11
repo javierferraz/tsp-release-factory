@@ -1,12 +1,12 @@
 # publish.yml (R6, S-1069): lo que necesitan scripts/publish.py, scripts/mock_servers.py y
 # tests/test_publish.py. Los scripts del repo central que llama solo usan la biblioteca
 # estandar. Versiones fijadas (freeze de la prueba en seco del 2026-11-10, Python 3.12).
-# Authenticode: lo comprueba osslsigncode (apt, en publish.yml); de aqui solo sale la raiz de
+# Authenticode: lo comprueba osslsigncode 2.9 (vendor/, en publish.yml); de aqui solo sale la raiz de
 # Microsoft (mscerts, con huella fijada en publish.py). Sin signify: su oscrypto 1.3.0 no
 # reconoce el OpenSSL 3.0.13 de ubuntu-24.04.
 mscerts==2026.10.27
 # El sello de tiempo RFC 3161 se saca de la firma con asn1crypto (Python puro) y lo verifica
-# el openssl del runner: osslsigncode 2.8 no sabe leer el de Microsoft.
+# el openssl del runner: osslsigncode no sabe leer el de Microsoft.
 asn1crypto==1.5.1
 # FTPS y sign-manifest simulados (modo en seco)
 pyftpdlib==2.2.0

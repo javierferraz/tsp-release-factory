@@ -174,9 +174,10 @@ Todo lo hace `scripts/publish.py` con los scripts del repo central, como el fluj
 2. Descarga los ficheros de la Release y comprueba tamaño, SHA256 (contra `SHA256SUMS` o contra
    el manifest si esa versión ya estaba publicada), Authenticode (firmante, y firma y sello de tiempo
    hasta la raíz de Microsoft, con esa raíz de `mscerts` fijada por huella como único ancla: el
-   sello lo verifica `openssl cms` y la firma `osslsigncode` 2.8 de apt a la hora del sello, porque
-   el certificado de Azure Trusted Signing dura 3 días y osslsigncode 2.8 no sabe leer el sello de
-   Microsoft) y, en Tauri, el `.sig` con la pubkey de `tauri.conf.json`.
+   sello lo verifica `openssl cms` y la firma `osslsigncode` 2.9 (el `.deb` de Ubuntu de
+   `vendor/`, con su SHA256) a la hora del sello y sin CRL, porque el certificado de Azure Trusted
+   Signing dura 3 días y osslsigncode no sabe leer el sello de Microsoft; la 2.8 de noble no sirve:
+   sin `-ignore-crl`, falla siempre) y, en Tauri, el `.sig` con la pubkey de `tauri.conf.json`.
 3. Entrada del manifest: Windows estable, Linux experimental, notas en inglés de
    `release-notes.json` de la Release; esquema con `validate_manifest.validate_schema`.
 4. `ftp_release.py --fabrica`: sube binarios, `SHA256SUMS` y el manifest firmado, **sin poda,

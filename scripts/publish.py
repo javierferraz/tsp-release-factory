@@ -402,7 +402,7 @@ def ms_root_pem(work):
 
 
 def parse_osslsigncode(out):
-    """Firmante (CN) de la salida de 'osslsigncode verify' (2.8). Fallo si algo no es ok."""
+    """Firmante (CN) de la salida de 'osslsigncode verify' (2.9). Fallo si algo no es ok."""
     total = re.search(r'^Number of verified signatures: (\d+)$', out, re.M)
     oks = re.findall(r'^Signature verification: ok$', out, re.M)
     if not total or int(total.group(1)) < 1 or len(oks) != int(total.group(1)):
@@ -440,7 +440,7 @@ def pe_signature(path):
 def authenticode_timestamp(path, root_pem, work, log=None):
     """Hora del sello de tiempo de la firma principal, verificado con openssl cms hasta la raiz.
 
-    Hace falta aparte: osslsigncode 2.8 exige al sello un signingTime que los de Microsoft no
+    Hace falta aparte: osslsigncode (2.8 y 2.9) exige al sello un signingTime que los de Microsoft no
     llevan, lo da por «not available» y verifica a la hora actual, cuando el certificado de
     Azure Trusted Signing (3 dias) ya ha caducado (run 42970816333)."""
     from asn1crypto import cms, tsp
@@ -466,7 +466,7 @@ def authenticode_timestamp(path, root_pem, work, log=None):
 
 
 def verify_authenticode(path, root_pem, work, log=None):
-    """Sello de tiempo con openssl y firma con osslsigncode (apt) a la hora del sello, contra la
+    """Sello de tiempo con openssl y firma con osslsigncode 2.9 a la hora del sello, contra la
     raiz de Microsoft. Devuelve (firmante, hora del sello)."""
     if not shutil.which('osslsigncode'):
         raise Fallo('falta osslsigncode para comprobar Authenticode')
@@ -474,10 +474,11 @@ def verify_authenticode(path, root_pem, work, log=None):
         when = authenticode_timestamp(path, root_pem, work, log)
     except Fallo as e:
         raise Fallo(f'Authenticode de {Path(path).name}: {e}')
-    # -ignore-timestamp + -time: el sello ya esta verificado arriba. -ignore-cdp: sin CRL en linea,
-    # como el flujo manual (y sin depender de la red de Microsoft).
+    # -ignore-timestamp + -time: el sello ya esta verificado arriba. -ignore-crl (2.9+): sin CRL, como
+    # el flujo manual. La CRL se comprueba a la hora actual, con el certificado de 3 dias ya caducado,
+    # y en 2.8 -ignore-cdp sin -CRLfile da «failed» siempre (run 43044044917).
     p = run(['osslsigncode', 'verify', '-in', str(path), '-CAfile', str(root_pem), '-ignore-timestamp',
-             '-time', str(int(when.timestamp())), '-ignore-cdp'], check=False, log=log)
+             '-time', str(int(when.timestamp())), '-ignore-crl'], check=False, log=log)
     try:
         return parse_osslsigncode((p.stdout or '').replace('\r\n', '\n')), when
     except Fallo as e:
