@@ -183,6 +183,67 @@ def test_display_name_y_downloads_hidden(tmp_path):
         publish.display_name(tmp_path, 'no-existe')
 
 
+# ── Authenticode (osslsigncode 2.8) ──
+# Salida armada con los printf de osslsigncode.c del tag 2.8 (verify_signature, print_cert y
+# main): en Windows no hay osslsigncode; el run de publish.yml la ejecuta de verdad.
+
+def ossl_out(subject='/C=ES/ST=Zaragoza/L=Zaragoza/O=Francisco Javier Ferraz Rives/CN=Francisco Javier Ferraz Rives',
+             sig='ok', ts='ok', n=1, final='Succeeded'):
+    block = ("\nSignature Index: 0  (Primary Signature)\n\n"
+             "Message digest algorithm  : SHA256\nCurrent message digest    : AB\nCalculated message digest : AB\n\n"
+             "Signer's certificate:\n\t------------------\n\tSigner #0:\n"
+             f"\t\tSubject: {subject}\n\t\tIssuer : /C=US/O=Microsoft Corporation/CN=Microsoft ID Verified CS EOC CA 04\n"
+             "\t\tSerial : 33\n\t\tCertificate expiration date:\n\t\t\tnotBefore : Nov  1 00:00:00 2026 GMT\n"
+             "\t\t\tnotAfter : Nov  4 00:00:00 2026 GMT\n\nCAfile: ms-root.pem\nTSA's certificates file: ms-root.pem\n"
+             f"Timestamp Server Signature verification: {ts}\nSignature verification: {sig}\n\n")
+    return f"Current PE checksum   : 00C6B2A5\n{block}Number of verified signatures: {n}\n{final}\n"
+
+
+def test_parse_osslsigncode_ok():
+    assert publish.parse_osslsigncode(ossl_out()) == 'Francisco Javier Ferraz Rives'
+
+
+@pytest.mark.parametrize('kw', [
+    {'sig': 'failed', 'final': 'Failed'},
+    {'ts': 'failed'},
+    {'subject': '/C=US/O=Otro/CN=Otro Firmante'},
+    {'n': 2},
+    {'n': 0},
+    {'final': 'Failed'},
+])
+def test_parse_osslsigncode_rechaza(kw):
+    with pytest.raises(Fallo):
+        publish.parse_osslsigncode(ossl_out(**kw))
+
+
+def test_parse_osslsigncode_sin_sello_de_tiempo():
+    out = ossl_out().replace('Timestamp Server Signature verification: ok\n', '\nTimestamp is not available\n\n')
+    with pytest.raises(Fallo, match='sello de tiempo'):
+        publish.parse_osslsigncode(out)
+
+
+def test_ms_root_pem_es_la_raiz_de_microsoft(tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_pem_x509_certificate(publish.ms_root_pem(tmp_path).read_bytes())
+    assert cert.fingerprint(hashes.SHA256()).hex() == publish.MS_ROOT_SHA256
+    assert cert.subject.rfc4514_string().startswith(publish.MS_ROOT)
+
+
+@pytest.mark.skipif(not shutil.which('osslsigncode') or not os.environ.get('TSP_AUTHENTICODE_SAMPLE'),
+                    reason='sin osslsigncode o sin TSP_AUTHENTICODE_SAMPLE (un instalador firmado)')
+def test_verify_authenticode_real_y_manipulado(tmp_path):
+    sample = Path(os.environ['TSP_AUTHENTICODE_SAMPLE'])
+    root = publish.ms_root_pem(tmp_path)
+    assert publish.verify_authenticode(sample, root) == 'Francisco Javier Ferraz Rives'
+    bad = tmp_path / sample.name
+    data = bytearray(sample.read_bytes())
+    data[len(data) // 3] ^= 0xFF
+    bad.write_bytes(bytes(data))
+    with pytest.raises(Fallo):
+        publish.verify_authenticode(bad, root)
+
+
 def test_dryrun_sig_ignora_el_orden_de_las_claves():
     assert dryrun_sig({'a': 1, 'b': [1, 2]}) == dryrun_sig({'b': [1, 2], 'a': 1})
     assert dryrun_sig({'a': 1}) != dryrun_sig({'a': 2})

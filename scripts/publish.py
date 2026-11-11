@@ -7,7 +7,7 @@ manual de tsp-create-dist §3 y tsp-linux-build §5, usando los scripts del repo
   1. Entradas y Release: la Release existe, no es borrador y trae los ficheros esperados.
   2. Descarga y comprobacion: tamano, SHA256 (contra SHA256SUMS de la Release o contra el
      manifest si esa version ya estaba publicada), Authenticode del instalador (firmante
-     esperado y cadena de Microsoft) y, en Tauri, el .sig contra la pubkey de tauri.conf.json.
+     esperado y cadena de Microsoft, con osslsigncode) y, en Tauri, el .sig contra la pubkey de tauri.conf.json.
   3. Entrada del manifest (Windows estable, Linux experimental, notas en ingles de
      release-notes.json) y esquema validado con validate_manifest.validate_schema.
   4-5. ftp_release.py --fabrica (sube binarios + SHA256SUMS + manifest firmado por
@@ -52,8 +52,10 @@ from pathlib import Path
 FACTORY = Path(__file__).resolve().parent.parent
 SITE = 'https://thestromboliproject.com'
 UPDATES_PREFIX = f'{SITE}/updates/'
-EXPECTED_SIGNER = 'CN=Francisco Javier Ferraz Rives'
+EXPECTED_SIGNER = 'Francisco Javier Ferraz Rives'
 MS_ROOT = 'CN=Microsoft Identity Verification Root Certificate Authority 2020'
+# Huella SHA256 de esa raiz: la de mscerts y la embebida en los instaladores firmados coinciden (2026-11-11)
+MS_ROOT_SHA256 = '5367f20c7ade0e2bca790915056d086b720c33c1fa2a2661acf787e3292e1270'
 SLUG_RE = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
 REPO_RE = re.compile(r'^javierferraz/[A-Za-z0-9._-]+$')
 VER_RE = re.compile(r'^\d+\.\d+\.\d+$')
@@ -373,26 +375,63 @@ def news_insert(text, date, name, version, notes, slug):
 
 # ───────────────────────────── firmas ─────────────────────────────
 
-def verify_authenticode(path):
-    """Devuelve el firmante. Fallo si la firma no vale o no es la esperada."""
+def ms_root_pem(work):
+    """La raiz de Microsoft, sacada de mscerts y comprobada por huella, como unico ancla.
+
+    Con solo ella en -CAfile y -TSA-CAfile, una verificacion ok de osslsigncode implica que la
+    cadena del firmante y la del sello de tiempo terminan ahi."""
+    import mscerts
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    import warnings
+    pems = re.findall(rb'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----',
+                      Path(mscerts.where()).read_bytes(), re.S)
+    for pem in pems:   # uno a uno: el bundle trae alguno con serie negativa que cryptography acabara rechazando
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                cert = x509.load_pem_x509_certificate(pem)
+        except ValueError:
+            continue
+        if cert.fingerprint(hashes.SHA256()).hex() == MS_ROOT_SHA256:
+            path = work / 'ms-root.pem'
+            path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+            return path
+    raise Fallo(f'mscerts no trae {MS_ROOT} con la huella esperada')
+
+
+def parse_osslsigncode(out):
+    """Firmante (CN) de la salida de 'osslsigncode verify' (2.8). Fallo si algo no es ok."""
+    total = re.search(r'^Number of verified signatures: (\d+)$', out, re.M)
+    oks = re.findall(r'^Signature verification: ok$', out, re.M)
+    if not total or int(total.group(1)) < 1 or len(oks) != int(total.group(1)):
+        raise Fallo('alguna firma no verifica (o el digest del fichero no coincide)')
+    if re.search(r'^Signature verification: failed$', out, re.M) or not re.search(r'^Succeeded$', out, re.M):
+        raise Fallo('osslsigncode no da Succeeded')
+    ts = re.findall(r'^Timestamp Server Signature verification: (\w+)$', out, re.M)
+    if len(ts) != len(oks) or any(t != 'ok' for t in ts):
+        raise Fallo('falta el sello de tiempo o no verifica con la raiz de Microsoft')
+    signers = re.findall(r"^Signer's certificate:\n\t-+\n\tSigner #0:\n\t\tSubject: (.*)$", out, re.M)
+    if len(signers) != len(oks):
+        raise Fallo('no se encuentra el firmante en la salida de osslsigncode')
+    for subject in signers:
+        cn = re.search(r'/CN=([^/]+)', subject)
+        if not cn or cn.group(1) != EXPECTED_SIGNER:
+            raise Fallo(f'firmado por {subject}, no por CN={EXPECTED_SIGNER}')
+    return EXPECTED_SIGNER
+
+
+def verify_authenticode(path, root_pem, log=None):
+    """osslsigncode (apt) contra la raiz de Microsoft. Devuelve el firmante."""
+    if not shutil.which('osslsigncode'):
+        raise Fallo('falta osslsigncode para comprobar Authenticode')
+    # -ignore-cdp: sin consulta de CRL en linea, como el flujo manual (y sin depender de la red de Microsoft)
+    p = run(['osslsigncode', 'verify', '-in', str(path), '-CAfile', str(root_pem), '-TSA-CAfile', str(root_pem),
+             '-ignore-cdp'], check=False, log=log)
     try:
-        from signify.authenticode import AuthenticodeFile, AuthenticodeVerificationResult
-    except Exception as e:   # p. ej. oscrypto 1.3.0 con OpenSSL 3.0.10+: no sabe leer su version
-        raise Fallo(f'no se puede comprobar Authenticode en esta maquina ({type(e).__name__}: {e})')
-    with open(path, 'rb') as fh:
-        af = AuthenticodeFile.from_stream(fh)
-        result, err = af.explain_verify()
-        if result != AuthenticodeVerificationResult.OK:
-            raise Fallo(f'Authenticode de {Path(path).name}: {result.name} ({err})')
-        chains = []
-        for sd in af.iter_signatures():
-            chains.extend(sd.verify())
-    for chain in chains:
-        dns = [c.subject.dn for c in chain]
-        if dns and dns[0].startswith(MS_ROOT) and dns[-1].startswith(EXPECTED_SIGNER):
-            return dns[-1].split(',')[0][3:]
-    raise Fallo(f'Authenticode de {Path(path).name}: firmado, pero no por {EXPECTED_SIGNER} '
-                f'con la raiz de Microsoft ({[[c.subject.dn for c in ch] for ch in chains]})')
+        return parse_osslsigncode((p.stdout or '').replace('\r\n', '\n'))
+    except Fallo as e:
+        raise Fallo(f'Authenticode de {Path(path).name}: {e} (osslsigncode salio con {p.returncode})')
 
 
 def verify_minisign(path, sig, pubkey):
@@ -541,8 +580,9 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
             'release': rel, 'files': {}, 'latest': {}, 'windows_format': 'nsis' if tauri else 'inno'}
 
     if 'windows' in plats:
-        signer = verify_authenticode(dest / names['setup'])
-        rep.check(slug, f'Authenticode del instalador valido (firmante {signer}, raiz de Microsoft)')
+        signer = verify_authenticode(dest / names['setup'], ms_root_pem(work), log=work / f'{slug}.log')
+        rep.check(slug, f'Authenticode del instalador valido con osslsigncode (firmante {signer}; firma y sello '
+                        'de tiempo hasta la raiz de Microsoft)')
         if tauri:
             pubkey = conf.get('plugins', {}).get('updater', {}).get('pubkey')
             if not pubkey:
