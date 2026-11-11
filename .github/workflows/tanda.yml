@@ -1,0 +1,168 @@
+# S-1069 R8: lleva a cabo la tanda de releases que prepara el Vigía Releases del central (R7).
+#
+# Lanzarlo ES el «sí» de Javier: el aviso [RELEASES] de Telegram trae el botón «Sí, publica la
+# tanda», que abre esta página; «Run workflow» con «Ensayo» desmarcado publica. Así el «sí» pasa por
+# el login y el 2FA de GitHub y no hace falta ningún servidor escuchando el bot.
+# Sin «sí» en 24 h la tanda caduca: scripts/tanda.py plan la rechaza.
+#
+# Por cada app lista:
+#   1. Si falta el tag: sube la versión, sella el CHANGELOG, commit y tag vX.Y.Z en su repo.
+#   2. Construye en esta fábrica lo que la Release aún no tenga: Windows y después Linux (una a una
+#      para que no compitan al crear la Release).
+#   3. Sube release-notes.json (las notas en inglés de la tanda) a la Release.
+#   Las apps que fallan en 1-3 se quedan fuera; las demás siguen.
+#   4. Lanza publish.yml con las que llegaron y espera su resultado.
+#
+# En ensayo (por defecto): no hace push ni tags (solo comprueba que el token podría), no construye
+# nada, y publish.yml corre en seco con las notas de la tanda; solo entran las apps que ya tienen
+# tag y Release (p. ej. una primera versión ya construida).
+
+name: Tanda
+run-name: Tanda ${{ inputs.fecha || '(la última)' }} ${{ inputs.dry_run && '(ensayo)' || '(REAL)' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      fecha:
+        description: 'Fecha de la tanda (AAAA-MM-DD); vacío = la última'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Ensayo: sin tags, sin builds y publicación en seco. Desmárcalo para publicar.'
+        required: false
+        type: boolean
+        default: true
+
+# GITHUB_TOKEN solo lanza y sigue los workflows de esta fábrica; los repos de las apps y el central
+# van con APPS_TOKEN.
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: tanda
+  cancel-in-progress: false
+
+jobs:
+  tanda:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      FECHA: ${{ inputs.fecha }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout de la fabrica
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Plan
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+        run: |
+          [ "$DRY_RUN" = true ] || [ "$DRY_RUN" = false ] || { echo "::error::dry_run no valido"; exit 1; }
+          [ -z "$FECHA" ] || [[ "$FECHA" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::fecha no valida: '$FECHA'"; exit 1; }
+          echo "T=$RUNNER_TEMP/tanda" >> "$GITHUB_ENV"
+          python3 scripts/tanda.py plan --fecha "$FECHA" --out "$RUNNER_TEMP/tanda" | tee "$RUNNER_TEMP/plan.txt"
+          { echo "## Tanda $(jq -r .fecha "$RUNNER_TEMP/tanda/plan.json") $([ "$DRY_RUN" = true ] && echo '(ensayo)' || echo '(REAL)')"
+            echo; echo '```'; cat "$RUNNER_TEMP/plan.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          : > "$RUNNER_TEMP/tanda/listas.txt"
+
+      - name: Tags, builds y notas
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+          FACTORY_TOKEN: ${{ github.token }}
+        run: |
+          plan="$T/plan.json"
+          git config --global user.name "tsp-tanda"
+          git config --global user.email "actions@users.noreply.github.com"
+          resumen() { echo "- $*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          lanzar() {  # lanza un workflow de esta fabrica y espera a que acabe bien
+            local wf=$1 url; shift
+            url=$(GH_TOKEN=$FACTORY_TOKEN gh workflow run "$wf" -R "$GITHUB_REPOSITORY" --ref main "$@" 2>&1 | grep -o 'https://[^ ]*/runs/[0-9]*' | tail -1)
+            [ -n "$url" ] || { echo "no pude lanzar $wf"; return 1; }
+            echo "$wf -> $url"
+            GH_TOKEN=$FACTORY_TOKEN gh run watch "${url##*/}" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null
+          }
+          n=$(jq '.apps | length' "$plan")
+          for i in $(seq 0 $((n - 1))); do
+            get() { jq -r ".apps[$i].$1" "$plan"; }
+            app=$(get app); repo=$(get repo); ver=$(get version); tag=$(get tag); stack=$(get stack)
+            if [ "$(get accion)" != publicar ]; then resumen "$app $ver: $(get motivo)"; continue; fi
+            [[ "$app" =~ ^[a-z0-9-]+$ && "$repo" =~ ^javierferraz/[A-Za-z0-9._-]+$ && "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$stack" =~ ^(tauri|pyside)$ ]] \
+              || { resumen "$app: entrada no valida en la tanda, fuera"; continue; }
+
+            # 1. Tag
+            if [ "$(get crear_tag)" = true ]; then
+              dir="$RUNNER_TEMP/app-$app"
+              git clone -q "https://x-access-token:${GH_TOKEN}@github.com/$repo.git" "$dir"                 || { resumen "$app $ver: no pude clonar $repo, fuera"; continue; }
+              if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)"); then
+                resumen "$app $ver: no pude subir la versión o sellar el CHANGELOG, fuera"; continue
+              fi
+              read -ra files <<< "$tocados"
+              ( cd "$dir" && git add -- "${files[@]}" && git commit -q -m "release: v$ver (tanda $(jq -r .fecha "$plan"))" && git tag -a "$tag" -m "$tag" )                 || { resumen "$app $ver: no pude hacer el commit o el tag, fuera"; continue; }
+              ( cd "$dir" && git --no-pager show --stat --format='%s' HEAD )
+              if [ "$DRY_RUN" = true ]; then
+                if ( cd "$dir" && git push --dry-run -q origin HEAD "$tag" ); then
+                  resumen "$app $ver: ensayo, se crearía el tag $tag (el token puede subirlo); sin tag no se construye ni se publica"
+                else
+                  resumen "$app $ver: ensayo, el token NO puede subir el tag a $repo"
+                fi
+                continue
+              fi
+              if ! ( cd "$dir" && git push -q origin HEAD "$tag" ); then
+                resumen "$app $ver: no pude subir el commit y el tag, fuera"; continue
+              fi
+              resumen "$app $ver: versión subida, CHANGELOG sellado y tag $tag creado"
+            fi
+
+            # 2. Builds (Windows y despues Linux)
+            ok=true
+            for plat in windows linux; do
+              [ "$(get "build_$plat")" = true ] || continue
+              if [ "$DRY_RUN" = true ]; then
+                resumen "$app $ver: ensayo, faltaría construir $plat; no se publica en seco"; ok=false; continue
+              fi
+              if lanzar "build-$stack-$plat.yml" -f app="$app" -f repo="$repo" -f tag="$tag"; then
+                resumen "$app $ver: build de $plat verde"
+              else
+                resumen "$app $ver: falló el build de $plat, fuera"; ok=false; break
+              fi
+            done
+            $ok || continue
+
+            # 3. Notas
+            python3 scripts/tanda.py notas --plan "$plan" --app "$app" --out "$T/release-notes.json"
+            if [ "$DRY_RUN" = false ]; then
+              if ! gh release upload "$tag" "$T/release-notes.json" -R "$repo" --clobber; then
+                resumen "$app $ver: no pude subir release-notes.json, fuera"; continue
+              fi
+            fi
+            echo "$i" >> "$T/listas.txt"
+          done
+
+      - name: Publicar
+        env:
+          FACTORY_TOKEN: ${{ github.token }}
+        run: |
+          plan="$T/plan.json"
+          if [ ! -s "$T/listas.txt" ]; then
+            echo "- Ninguna app llegó a publicarse" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          idx=$(paste -sd, "$T/listas.txt")
+          apps=$(jq -c "[.apps[$idx] | {app, repo, version, platforms}]" "$plan")
+          args=(-f apps="$apps" -f dry_run="$DRY_RUN")
+          if [ "$DRY_RUN" = true ]; then
+            args+=(-f notas_seco="$(jq -c "[.apps[$idx] | {key: .app, value: (.notas | with_entries(select(.key == \"windows\" or .key == \"linux\")))}] | from_entries" "$plan")")
+          fi
+          echo "publish.yml con: $apps" | tee -a "$GITHUB_STEP_SUMMARY"
+          url=$(GH_TOKEN=$FACTORY_TOKEN gh workflow run publish.yml -R "$GITHUB_REPOSITORY" --ref main "${args[@]}" 2>&1 | grep -o 'https://[^ ]*/runs/[0-9]*' | tail -1)
+          [ -n "$url" ] || { echo "::error::no pude lanzar publish.yml"; exit 1; }
+          echo "- publish.yml: $url" >> "$GITHUB_STEP_SUMMARY"
+          GH_TOKEN=$FACTORY_TOKEN gh run watch "${url##*/}" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null

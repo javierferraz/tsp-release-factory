@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: true
+      notas_seco:
+        description: 'Solo en seco: notas por app {"slug":{"windows","linux"}} en lugar del release-notes.json (las pasa tanda.yml)'
+        required: false
+        type: string
+        default: ''
 
 # El GITHUB_TOKEN no se usa: el central y los repos de las apps van con APPS_TOKEN.
 permissions:
@@ -60,6 +65,7 @@ jobs:
       # Las entradas se usan siempre por variable de entorno, nunca interpoladas en el script.
       APPS: ${{ inputs.apps }}
       DRY_RUN: ${{ inputs.dry_run }}
+      NOTAS_SECO: ${{ inputs.notas_seco }}
       CENTRAL_REPO: javierferraz/2606-thestromboliproject
     steps:
       - name: Inicio
@@ -156,6 +162,13 @@ jobs:
                          "_release_signing_secret": os.environ["SIGNING_SECRET"]}, f)
           PY
             args+=(--publicar)
+          elif [ -n "$NOTAS_SECO" ]; then
+            while IFS= read -r slug; do
+              args+=(--notas "$slug=$WORK/notas-$slug.json")
+            done < <(python -c 'import json,os,re
+          for k, v in json.loads(os.environ["NOTAS_SECO"]).items():
+              assert re.fullmatch(r"[a-z0-9-]+", k), k
+              open(os.path.join(os.environ["WORK"], f"notas-{k}.json"), "w", encoding="utf-8").write(json.dumps(v)); print(k)')
           fi
           python factory/scripts/publish.py "${args[@]}"
 
