@@ -42,6 +42,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -408,9 +409,6 @@ def parse_osslsigncode(out):
         raise Fallo('alguna firma no verifica (o el digest del fichero no coincide)')
     if re.search(r'^Signature verification: failed$', out, re.M) or not re.search(r'^Succeeded$', out, re.M):
         raise Fallo('osslsigncode no da Succeeded')
-    ts = re.findall(r'^Timestamp Server Signature verification: (\w+)$', out, re.M)
-    if len(ts) != len(oks) or any(t != 'ok' for t in ts):
-        raise Fallo('falta el sello de tiempo o no verifica con la raiz de Microsoft')
     signers = re.findall(r"^Signer's certificate:\n\t-+\n\tSigner #0:\n\t\tSubject: (.*)$", out, re.M)
     if len(signers) != len(oks):
         raise Fallo('no se encuentra el firmante en la salida de osslsigncode')
@@ -421,15 +419,67 @@ def parse_osslsigncode(out):
     return EXPECTED_SIGNER
 
 
-def verify_authenticode(path, root_pem, log=None):
-    """osslsigncode (apt) contra la raiz de Microsoft. Devuelve el firmante."""
+MS_RFC3161 = '1.3.6.1.4.1.311.3.3.1'   # sello de tiempo RFC 3161 anidado de Authenticode
+
+
+def pe_signature(path):
+    """La firma PKCS#7 (DER) de la tabla de certificados del PE."""
+    data = Path(path).read_bytes()
+    pe = int.from_bytes(data[0x3C:0x40], 'little')
+    if data[pe:pe + 4] != b'PE\0\0':
+        raise Fallo('no es un ejecutable PE')
+    opt = pe + 24
+    magic = int.from_bytes(data[opt:opt + 2], 'little')
+    off, size = struct.unpack_from('<II', data, opt + (96 if magic == 0x10b else 112) + 4 * 8)
+    if not off or not size or off + 8 > len(data):
+        raise Fallo('el ejecutable no lleva firma Authenticode')
+    length = struct.unpack_from('<I', data, off)[0]
+    return data[off + 8:off + length]
+
+
+def authenticode_timestamp(path, root_pem, work, log=None):
+    """Hora del sello de tiempo de la firma principal, verificado con openssl cms hasta la raiz.
+
+    Hace falta aparte: osslsigncode 2.8 exige al sello un signingTime que los de Microsoft no
+    llevan, lo da por «not available» y verifica a la hora actual, cuando el certificado de
+    Azure Trusted Signing (3 dias) ya ha caducado (run 42970816333)."""
+    from asn1crypto import cms, tsp
+    signer = cms.ContentInfo.load(pe_signature(path), strict=False)['content']['signer_infos'][0]
+    token = next((a['values'][0] for a in (signer['unsigned_attrs'] or []) if a['type'].dotted == MS_RFC3161), None)
+    if token is None:
+        raise Fallo('la firma no lleva sello de tiempo RFC 3161')
+    claimed = token['content']['encap_content_info']['content'].parsed['gen_time'].native
+    tok, out = work / 'ts-token.der', work / 'ts-tstinfo.der'
+    tok.write_bytes(token.dump())
+    p = run(['openssl', 'cms', '-verify', '-inform', 'DER', '-in', str(tok), '-CAfile', str(root_pem),
+             '-purpose', 'timestampsign', '-attime', str(int(claimed.timestamp())), '-binary', '-out', str(out)],
+            check=False, log=log)
+    if p.returncode != 0:
+        raise Fallo('el sello de tiempo no verifica hasta la raiz de Microsoft')
+    tst = tsp.TSTInfo.load(out.read_bytes())   # lo que openssl ha verificado, no lo que dice el token
+    alg = tst['message_imprint']['hash_algorithm']['algorithm'].native
+    if hashlib.new(alg, signer['signature'].native).digest() != tst['message_imprint']['hashed_message'].native:
+        raise Fallo('el sello de tiempo no corresponde a esta firma')
+    if tst['gen_time'].native != claimed:
+        raise Fallo('la hora del sello verificado no es la del token')
+    return tst['gen_time'].native
+
+
+def verify_authenticode(path, root_pem, work, log=None):
+    """Sello de tiempo con openssl y firma con osslsigncode (apt) a la hora del sello, contra la
+    raiz de Microsoft. Devuelve (firmante, hora del sello)."""
     if not shutil.which('osslsigncode'):
         raise Fallo('falta osslsigncode para comprobar Authenticode')
-    # -ignore-cdp: sin consulta de CRL en linea, como el flujo manual (y sin depender de la red de Microsoft)
-    p = run(['osslsigncode', 'verify', '-in', str(path), '-CAfile', str(root_pem), '-TSA-CAfile', str(root_pem),
-             '-ignore-cdp'], check=False, log=log)
     try:
-        return parse_osslsigncode((p.stdout or '').replace('\r\n', '\n'))
+        when = authenticode_timestamp(path, root_pem, work, log)
+    except Fallo as e:
+        raise Fallo(f'Authenticode de {Path(path).name}: {e}')
+    # -ignore-timestamp + -time: el sello ya esta verificado arriba. -ignore-cdp: sin CRL en linea,
+    # como el flujo manual (y sin depender de la red de Microsoft).
+    p = run(['osslsigncode', 'verify', '-in', str(path), '-CAfile', str(root_pem), '-ignore-timestamp',
+             '-time', str(int(when.timestamp())), '-ignore-cdp'], check=False, log=log)
+    try:
+        return parse_osslsigncode((p.stdout or '').replace('\r\n', '\n')), when
     except Fallo as e:
         raise Fallo(f'Authenticode de {Path(path).name}: {e} (osslsigncode salio con {p.returncode})')
 
@@ -580,9 +630,10 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
             'release': rel, 'files': {}, 'latest': {}, 'windows_format': 'nsis' if tauri else 'inno'}
 
     if 'windows' in plats:
-        signer = verify_authenticode(dest / names['setup'], ms_root_pem(work), log=work / f'{slug}.log')
-        rep.check(slug, f'Authenticode del instalador valido con osslsigncode (firmante {signer}; firma y sello '
-                        'de tiempo hasta la raiz de Microsoft)')
+        signer, when = verify_authenticode(dest / names['setup'], ms_root_pem(work), work, log=work / f'{slug}.log')
+        rep.check(slug, f'Authenticode del instalador valido (firmante {signer}; sello de tiempo del '
+                        f'{when:%Y-%m-%d %H:%M} UTC con openssl y firma a esa hora con osslsigncode, '
+                        'las dos hasta la raiz de Microsoft)')
         if tauri:
             pubkey = conf.get('plugins', {}).get('updater', {}).get('pubkey')
             if not pubkey:

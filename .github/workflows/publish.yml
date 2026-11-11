@@ -104,6 +104,8 @@ jobs:
 
       # Authenticode del instalador: osslsigncode de Ubuntu (universe), version fijada y comprobada.
       # signify no sirve aqui: su oscrypto 1.3.0 no reconoce el OpenSSL 3.0.13 de ubuntu-24.04.
+      # El sello de tiempo lo verifica aparte el openssl del runner (osslsigncode 2.8 no lee el de
+      # Microsoft y verificaria a la hora actual, con el certificado de 3 dias ya caducado).
       - name: osslsigncode
         run: |
           sudo apt-get update -qq
@@ -150,8 +152,8 @@ jobs:
           fi
           python factory/scripts/publish.py "${args[@]}"
 
-      # Control de que osslsigncode de verdad rechaza: el primer instalador descargado, intacto
-      # tiene que pasar y con un byte cambiado no.
+      # Control de que la comprobacion de verdad rechaza: el primer instalador descargado, intacto,
+      # pasa; con un byte cambiado no, y su sello de tiempo con otra raiz de ancla tampoco.
       - name: Authenticode con un instalador manipulado
         if: always()
         env:
@@ -159,7 +161,7 @@ jobs:
         run: |
           sample="$(find "$WORK/descargas" -name '*-windows-x64-setup.exe' 2>/dev/null | sort | head -1)"
           [ -n "$sample" ] || { echo "sin instalador descargado: no hay control que hacer"; exit 0; }
-          TSP_AUTHENTICODE_SAMPLE="$sample" python -m pytest factory/tests/test_publish.py -q -p no:cacheprovider -k verify_authenticode_real -rs
+          TSP_AUTHENTICODE_SAMPLE="$sample" python -m pytest factory/tests/test_publish.py -q -p no:cacheprovider -k 'verify_authenticode_real or sello_de_tiempo_real' -rs
 
       - name: Resumen
         if: always()

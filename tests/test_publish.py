@@ -8,6 +8,7 @@ el de verdad). Necesita el central (TSP_CENTRAL o la carpeta hermana) y el puert
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -188,15 +189,18 @@ def test_display_name_y_downloads_hidden(tmp_path):
 # main): en Windows no hay osslsigncode; el run de publish.yml la ejecuta de verdad.
 
 def ossl_out(subject='/C=ES/ST=Zaragoza/L=Zaragoza/O=Francisco Javier Ferraz Rives/CN=Francisco Javier Ferraz Rives',
-             sig='ok', ts='ok', n=1, final='Succeeded'):
+             sig='ok', n=1, final='Succeeded'):
+    """Como sale con -ignore-timestamp -time (el sello se verifica aparte con openssl)."""
     block = ("\nSignature Index: 0  (Primary Signature)\n\n"
              "Message digest algorithm  : SHA256\nCurrent message digest    : AB\nCalculated message digest : AB\n\n"
              "Signer's certificate:\n\t------------------\n\tSigner #0:\n"
              f"\t\tSubject: {subject}\n\t\tIssuer : /C=US/O=Microsoft Corporation/CN=Microsoft ID Verified CS EOC CA 04\n"
-             "\t\tSerial : 33\n\t\tCertificate expiration date:\n\t\t\tnotBefore : Nov  1 00:00:00 2026 GMT\n"
-             "\t\t\tnotAfter : Nov  4 00:00:00 2026 GMT\n\nCAfile: ms-root.pem\nTSA's certificates file: ms-root.pem\n"
-             f"Timestamp Server Signature verification: {ts}\nSignature verification: {sig}\n\n")
-    return f"Current PE checksum   : 00C6B2A5\n{block}Number of verified signatures: {n}\n{final}\n"
+             "\t\tSerial : 33\n\t\tCertificate expiration date:\n\t\t\tnotBefore : Oct 28 03:19:15 2026 GMT\n"
+             "\t\t\tnotAfter : Oct 31 03:19:15 2026 GMT\n\nCAfile: ms-root.pem\n\n"
+             "Timestamp Server Signature verification is disabled\n"
+             "Signature verification time: Oct 29 13:24:41 2026 GMT\n"
+             f"Signature verification: {sig}\n\n")
+    return f"PE checksum   : 00C72808\n{block}Number of verified signatures: {n}\n{final}\n"
 
 
 def test_parse_osslsigncode_ok():
@@ -205,7 +209,6 @@ def test_parse_osslsigncode_ok():
 
 @pytest.mark.parametrize('kw', [
     {'sig': 'failed', 'final': 'Failed'},
-    {'ts': 'failed'},
     {'subject': '/C=US/O=Otro/CN=Otro Firmante'},
     {'n': 2},
     {'n': 0},
@@ -216,12 +219,6 @@ def test_parse_osslsigncode_rechaza(kw):
         publish.parse_osslsigncode(ossl_out(**kw))
 
 
-def test_parse_osslsigncode_sin_sello_de_tiempo():
-    out = ossl_out().replace('Timestamp Server Signature verification: ok\n', '\nTimestamp is not available\n\n')
-    with pytest.raises(Fallo, match='sello de tiempo'):
-        publish.parse_osslsigncode(out)
-
-
 def test_ms_root_pem_es_la_raiz_de_microsoft(tmp_path):
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
@@ -230,18 +227,46 @@ def test_ms_root_pem_es_la_raiz_de_microsoft(tmp_path):
     assert cert.subject.rfc4514_string().startswith(publish.MS_ROOT)
 
 
-@pytest.mark.skipif(not shutil.which('osslsigncode') or not os.environ.get('TSP_AUTHENTICODE_SAMPLE'),
-                    reason='sin osslsigncode o sin TSP_AUTHENTICODE_SAMPLE (un instalador firmado)')
-def test_verify_authenticode_real_y_manipulado(tmp_path):
-    sample = Path(os.environ['TSP_AUTHENTICODE_SAMPLE'])
+def test_pe_signature_sin_firma(tmp_path):
+    f = tmp_path / 'x.exe'
+    f.write_bytes(b'MZ' + bytes(200))
+    with pytest.raises(Fallo):
+        publish.pe_signature(f)
+
+
+SAMPLE = os.environ.get('TSP_AUTHENTICODE_SAMPLE')
+
+
+@pytest.mark.skipif(not shutil.which('openssl') or not SAMPLE, reason='sin openssl o sin TSP_AUTHENTICODE_SAMPLE')
+def test_sello_de_tiempo_real(tmp_path):
     root = publish.ms_root_pem(tmp_path)
-    assert publish.verify_authenticode(sample, root) == 'Francisco Javier Ferraz Rives'
+    when = publish.authenticode_timestamp(Path(SAMPLE), root, tmp_path)
+    assert when.year >= 2026
+    other = tmp_path / 'otra-raiz.pem'          # con otra raiz como ancla, el sello no verifica
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    import mscerts
+    pems = re.findall(rb'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----',
+                      Path(mscerts.where()).read_bytes(), re.S)
+    other.write_bytes(next(p for p in pems if b'Microsoft' not in
+                           x509.load_pem_x509_certificate(p).subject.rfc4514_string().encode()))
+    with pytest.raises(Fallo, match='raiz'):
+        publish.authenticode_timestamp(Path(SAMPLE), other, tmp_path)
+
+
+@pytest.mark.skipif(not shutil.which('osslsigncode') or not shutil.which('openssl') or not SAMPLE,
+                    reason='sin osslsigncode u openssl o sin TSP_AUTHENTICODE_SAMPLE (un instalador firmado)')
+def test_verify_authenticode_real_y_manipulado(tmp_path):
+    sample = Path(SAMPLE)
+    root = publish.ms_root_pem(tmp_path)
+    signer, _ = publish.verify_authenticode(sample, root, tmp_path)
+    assert signer == 'Francisco Javier Ferraz Rives'
     bad = tmp_path / sample.name
     data = bytearray(sample.read_bytes())
     data[len(data) // 3] ^= 0xFF
     bad.write_bytes(bytes(data))
     with pytest.raises(Fallo):
-        publish.verify_authenticode(bad, root)
+        publish.verify_authenticode(bad, root, tmp_path)
 
 
 def test_dryrun_sig_ignora_el_orden_de_las_claves():
