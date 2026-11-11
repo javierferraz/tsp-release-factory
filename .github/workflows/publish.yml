@@ -111,11 +111,9 @@ jobs:
       # Sus dependencias (libc6, libcurl4t64, libssl3t64, zlib1g) ya estan en ubuntu-24.04.
       - name: osslsigncode
         env:
-          DEB_URL: https://archive.ubuntu.com/ubuntu/pool/universe/o/osslsigncode/osslsigncode_2.8-2_amd64.deb
           DEB_SHA256: 1aee7be603102633e80b4c67cd939bba2e16a62813e4a3035696727783f632b0
         run: |
-          deb="$RUNNER_TEMP/osslsigncode.deb"
-          curl -fsSL --retry 5 --retry-all-errors -o "$deb" "$DEB_URL"
+          deb="$GITHUB_WORKSPACE/factory/vendor/osslsigncode_2.8-2_amd64.deb"
           echo "$DEB_SHA256  $deb" | sha256sum -c --quiet
           sudo dpkg -i "$deb" > /dev/null
           got="$(osslsigncode --version 2>&1 | head -1)"
