@@ -207,9 +207,14 @@ desmarcado publica; por defecto es ensayo.
    Windows y después Linux lo que la Release no tenga; sube `release-notes.json`. La que falla se
    queda fuera y las demás siguen.
 3. Lanza `publish.yml` con las que llegaron y espera su resultado.
+4. Pase lo que pase, deja el resultado en el central (R9): `docs/distribucion/tandas/resultados/<fecha>.json`
+   con lo publicado, lo que quedó fuera y por qué, y los minutos (Windows, Linux y facturables =
+   Windows × 2 + Linux). Ese push dispara `tsp-cierre-tanda.yml` en el central, que cierra la tanda,
+   apunta el ledger de Linux y avisa. Una copia queda como artifact `tanda-<run_id>`.
 
 En ensayo no hay push (solo `git push --dry-run`), ni tags, ni builds, y `publish.yml` corre en seco
-con las notas de la tanda (`notas_seco`). Ensayo verde: run 43125982189 (Bright Cardinal 1.0.0).
+con las notas de la tanda (`notas_seco`). Ensayos verdes: run 43125982189 (R8) y 43211697628 (R9),
+los dos con Bright Cardinal 1.0.0.
 
 ## Dónde corre cada test
 
