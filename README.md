@@ -196,6 +196,21 @@ revertiría) y el resumen dice hasta dónde llegó. Repetir una tanda ya publica
 una o dos frases en inglés para quien usa la app, sin números de tarjeta. Sin él, en real no se
 publica (en seco sale como «En real esto pararía la publicación»).
 
+## `tanda.yml` — el «sí» de la tanda (R8)
+
+Lo abre el botón «Sí, publica la tanda» del aviso [RELEASES]. «Run workflow» con «Ensayo»
+desmarcado publica; por defecto es ensayo.
+
+1. `scripts/tanda.py plan` lee del central `docs/distribucion/tandas/<fecha>.json` (vacío = la
+   última) y la rechaza si caducó (24 h), ya se publicó o no tiene apps.
+2. Por app: si falta el tag, sube la versión, sella el CHANGELOG, commit y tag `vX.Y.Z`; construye
+   Windows y después Linux lo que la Release no tenga; sube `release-notes.json`. La que falla se
+   queda fuera y las demás siguen.
+3. Lanza `publish.yml` con las que llegaron y espera su resultado.
+
+En ensayo no hay push (solo `git push --dry-run`), ni tags, ni builds, y `publish.yml` corre en seco
+con las notas de la tanda (`notas_seco`). Ensayo verde: run 43125982189 (Bright Cardinal 1.0.0).
+
 ## Dónde corre cada test
 
 Cada test, una sola vez por tanda y en Linux (la mitad de precio que Windows):
