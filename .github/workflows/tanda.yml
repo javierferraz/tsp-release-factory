@@ -12,6 +12,8 @@
 #   3. Sube release-notes.json (las notas en inglés de la tanda) a la Release.
 #   Las apps que fallan en 1-3 se quedan fuera; las demás siguen.
 #   4. Lanza publish.yml con las que llegaron y espera su resultado.
+#   5. Sube el resultado (qué se publicó, qué se quedó fuera y los minutos) al central, donde
+#      «TSP Cierre de tanda» la cierra y avisa por Telegram (R9).
 #
 # En ensayo (por defecto): no hace push ni tags (solo comprueba que el token podría), no construye
 # nada, y publish.yml corre en seco con las notas de la tanda; solo entran las apps que ya tienen
@@ -68,10 +70,13 @@ jobs:
           [ "$DRY_RUN" = true ] || [ "$DRY_RUN" = false ] || { echo "::error::dry_run no valido"; exit 1; }
           [ -z "$FECHA" ] || [[ "$FECHA" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::fecha no valida: '$FECHA'"; exit 1; }
           echo "T=$RUNNER_TEMP/tanda" >> "$GITHUB_ENV"
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
           python3 scripts/tanda.py plan --fecha "$FECHA" --out "$RUNNER_TEMP/tanda" | tee "$RUNNER_TEMP/plan.txt"
           { echo "## Tanda $(jq -r .fecha "$RUNNER_TEMP/tanda/plan.json") $([ "$DRY_RUN" = true ] && echo '(ensayo)' || echo '(REAL)')"
             echo; echo '```'; cat "$RUNNER_TEMP/plan.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           : > "$RUNNER_TEMP/tanda/listas.txt"
+          : > "$RUNNER_TEMP/tanda/minutos.txt"   # «windows|linux N» por cada build lanzado
+          : > "$RUNNER_TEMP/tanda/fuera.jsonl"   # {"app","motivo"} de las que se quedan fuera
 
       - name: Tags, builds y notas
         env:
@@ -82,12 +87,20 @@ jobs:
           git config --global user.name "tsp-tanda"
           git config --global user.email "actions@users.noreply.github.com"
           resumen() { echo "- $*" | tee -a "$GITHUB_STEP_SUMMARY"; }
-          lanzar() {  # lanza un workflow de esta fabrica y espera a que acabe bien
-            local wf=$1 url; shift
+          fuera() {   # la app se queda fuera: al resumen y al resultado que cierra la tanda (R9)
+            resumen "$app $ver: $1, fuera"
+            jq -nc --arg app "$app" --arg m "$1" '{app: $app, motivo: $m}' >> "$T/fuera.jsonl"
+          }
+          lanzar() {  # lanza un workflow de esta fabrica, espera a que acabe bien y apunta sus minutos
+            local wf=$1 url id rc=0 so; shift
             url=$(GH_TOKEN=$FACTORY_TOKEN gh workflow run "$wf" -R "$GITHUB_REPOSITORY" --ref main "$@" 2>&1 | grep -o 'https://[^ ]*/runs/[0-9]*' | tail -1)
             [ -n "$url" ] || { echo "no pude lanzar $wf"; return 1; }
+            id=${url##*/}
             echo "$wf -> $url"
-            GH_TOKEN=$FACTORY_TOKEN gh run watch "${url##*/}" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null
+            GH_TOKEN=$FACTORY_TOKEN gh run watch "$id" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null || rc=$?
+            case "$wf" in *windows*) so=windows ;; *) so=linux ;; esac
+            echo "$so $(GH_TOKEN=$FACTORY_TOKEN gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.startedAt != null and .completedAt != null) | (((.completedAt | fromdate) - (.startedAt | fromdate)) / 60 | ceil)] | add // 0' 2>/dev/null || echo 0)" >> "$T/minutos.txt"
+            return $rc
           }
           n=$(jq '.apps | length' "$plan")
           for i in $(seq 0 $((n - 1))); do
@@ -95,17 +108,17 @@ jobs:
             app=$(get app); repo=$(get repo); ver=$(get version); tag=$(get tag); stack=$(get stack)
             if [ "$(get accion)" != publicar ]; then resumen "$app $ver: $(get motivo)"; continue; fi
             [[ "$app" =~ ^[a-z0-9-]+$ && "$repo" =~ ^javierferraz/[A-Za-z0-9._-]+$ && "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$stack" =~ ^(tauri|pyside)$ ]] \
-              || { resumen "$app: entrada no valida en la tanda, fuera"; continue; }
+              || { fuera "entrada no valida en la tanda"; continue; }
 
             # 1. Tag
             if [ "$(get crear_tag)" = true ]; then
               dir="$RUNNER_TEMP/app-$app"
-              git clone -q "https://x-access-token:${GH_TOKEN}@github.com/$repo.git" "$dir"                 || { resumen "$app $ver: no pude clonar $repo, fuera"; continue; }
+              git clone -q "https://x-access-token:${GH_TOKEN}@github.com/$repo.git" "$dir"                 || { fuera "no pude clonar $repo"; continue; }
               if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)"); then
-                resumen "$app $ver: no pude subir la versión o sellar el CHANGELOG, fuera"; continue
+                fuera "no pude subir la versión o sellar el CHANGELOG"; continue
               fi
               read -ra files <<< "$tocados"
-              ( cd "$dir" && git add -- "${files[@]}" && git commit -q -m "release: v$ver (tanda $(jq -r .fecha "$plan"))" && git tag -a "$tag" -m "$tag" )                 || { resumen "$app $ver: no pude hacer el commit o el tag, fuera"; continue; }
+              ( cd "$dir" && git add -- "${files[@]}" && git commit -q -m "release: v$ver (tanda $(jq -r .fecha "$plan"))" && git tag -a "$tag" -m "$tag" )                 || { fuera "no pude hacer el commit o el tag"; continue; }
               ( cd "$dir" && git --no-pager show --stat --format='%s' HEAD )
               if [ "$DRY_RUN" = true ]; then
                 if ( cd "$dir" && git push --dry-run -q origin HEAD "$tag" ); then
@@ -116,7 +129,7 @@ jobs:
                 continue
               fi
               if ! ( cd "$dir" && git push -q origin HEAD "$tag" ); then
-                resumen "$app $ver: no pude subir el commit y el tag, fuera"; continue
+                fuera "no pude subir el commit y el tag"; continue
               fi
               resumen "$app $ver: versión subida, CHANGELOG sellado y tag $tag creado"
             fi
@@ -131,7 +144,7 @@ jobs:
               if lanzar "build-$stack-$plat.yml" -f app="$app" -f repo="$repo" -f tag="$tag"; then
                 resumen "$app $ver: build de $plat verde"
               else
-                resumen "$app $ver: falló el build de $plat, fuera"; ok=false; break
+                fuera "falló el build de $plat"; ok=false; break
               fi
             done
             $ok || continue
@@ -140,7 +153,7 @@ jobs:
             python3 scripts/tanda.py notas --plan "$plan" --app "$app" --out "$T/release-notes.json"
             if [ "$DRY_RUN" = false ]; then
               if ! gh release upload "$tag" "$T/release-notes.json" -R "$repo" --clobber; then
-                resumen "$app $ver: no pude subir release-notes.json, fuera"; continue
+                fuera "no pude subir release-notes.json"; continue
               fi
             fi
             echo "$i" >> "$T/listas.txt"
@@ -165,4 +178,68 @@ jobs:
           url=$(GH_TOKEN=$FACTORY_TOKEN gh workflow run publish.yml -R "$GITHUB_REPOSITORY" --ref main "${args[@]}" 2>&1 | grep -o 'https://[^ ]*/runs/[0-9]*' | tail -1)
           [ -n "$url" ] || { echo "::error::no pude lanzar publish.yml"; exit 1; }
           echo "- publish.yml: $url" >> "$GITHUB_STEP_SUMMARY"
-          GH_TOKEN=$FACTORY_TOKEN gh run watch "${url##*/}" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null
+          echo "$url" > "$T/publish_run.txt"
+          id=${url##*/} rc=0
+          GH_TOKEN=$FACTORY_TOKEN gh run watch "$id" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null || rc=$?
+          echo "linux $(GH_TOKEN=$FACTORY_TOKEN gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.startedAt != null and .completedAt != null) | (((.completedAt | fromdate) - (.startedAt | fromdate)) / 60 | ceil)] | add // 0' 2>/dev/null || echo 0)" >> "$T/minutos.txt"
+          # resultado.json de publish.py: qué app se publicó y cuál no, para el cierre (R9)
+          GH_TOKEN=$FACTORY_TOKEN gh run download "$id" -R "$GITHUB_REPOSITORY" -n "publish-$id" -D "$T/publish" || echo "sin artefacto de publish.yml"
+          exit $rc
+
+      # S-1069 R9: el resultado va al central (docs/distribucion/tandas/resultados/<fecha>.json) y su
+      # workflow «TSP Cierre de tanda» cierra la tanda, apunta Linux en el ledger y avisa por Telegram.
+      # También si algo falló: una tanda que no publica nada se cierra como «fallida» y se avisa.
+      # En ensayo solo se comprueba que el token podría subirlo y queda como artefacto.
+      - name: Resultado al central
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+        run: |
+          plan="$T/plan.json"
+          [ -f "$plan" ] || { echo "sin plan: no hay tanda que cerrar"; exit 0; }
+          fecha=$(jq -r .fecha "$plan")
+          res="$T/publish/resultado.json"
+          [ -f "$res" ] || echo '{"apps": []}' > "$res"
+          w=$(awk '$1 == "windows" {s += $2} END {print s + 0}' "$T/minutos.txt")
+          l=$(awk '$1 == "linux" {s += $2} END {print s + 0}' "$T/minutos.txt")
+          l=$(( l + ($(date +%s) - JOB_START) / 60 + 1 ))   # este job, que espera a los demás
+          pr=$(cat "$T/publish_run.txt" 2>/dev/null || true)
+          jq --arg modo "$([ "$DRY_RUN" = true ] && echo seco || echo real)" \
+             --arg tr "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg pr "$pr" \
+             --argjson w "$w" --argjson l "$l" --slurpfile fuera "$T/fuera.jsonl" \
+             '. + {modo: (.modo // $modo), tanda_run: $tr, publish_run: (if $pr == "" then null else $pr end),
+                   fuera: $fuera, minutos: {windows: $w, linux: $l, facturables: ($w * 2 + $l)}}' \
+             "$res" > "$T/resultado-tanda.json"
+          cat "$T/resultado-tanda.json"
+          dir="$RUNNER_TEMP/central"
+          git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/javierferraz/2606-thestromboliproject.git" "$dir"
+          mkdir -p "$dir/docs/distribucion/tandas/resultados"
+          cp "$T/resultado-tanda.json" "$dir/docs/distribucion/tandas/resultados/$fecha.json"
+          cd "$dir"
+          git config user.name "tsp-tanda"
+          git config user.email "actions@users.noreply.github.com"
+          git add "docs/distribucion/tandas/resultados/$fecha.json"
+          git diff --cached --quiet && { echo "el central ya tiene este resultado"; exit 0; }
+          git commit -q -m "releases: resultado de la tanda $fecha [sin tarjeta]"
+          if [ "$DRY_RUN" = true ]; then
+            if git push --dry-run -q origin HEAD:main; then
+              echo "- Ensayo: el resultado se subiría al central y cerraría la tanda (el token puede)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- Ensayo: el token NO puede subir el resultado al central" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          for i in 1 2 3; do
+            git push -q origin HEAD:main && { echo "- Resultado subido al central: lo cierra «TSP Cierre de tanda»" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            git pull -q --rebase origin main
+          done
+          echo "::error::no pude subir el resultado al central"; exit 1
+
+      - name: Guardar el resultado
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tanda-${{ github.run_id }}
+          path: ${{ runner.temp }}/tanda/resultado-tanda.json
+          if-no-files-found: ignore
+          retention-days: 14
