@@ -78,8 +78,10 @@ def validar(tanda, ahora):
                     'sin «sí» en 24 h no sale; espera a la siguiente')
 
 
-def publicada(manifest, slug):
+def publicada(manifest, slug, plataforma='windows-x64'):
     t = next((t for t in manifest.get('tools', []) if t.get('tool') == slug), None) or {}
+    if plataforma != 'windows-x64':
+        return (t.get('platforms', {}).get(plataforma) or {}).get('version')
     return (t.get('platforms', {}).get('windows-x64') or {}).get('version') or t.get('version')
 
 
@@ -87,7 +89,8 @@ def plan_app(app, manifest, tag_existe, assets):
     slug, ver = app['app'], app['version']
     p = {k: app[k] for k in ('app', 'repo', 'version', 'platforms', 'stack', 'notas')}
     p['tag'] = f'v{ver}'
-    if publicada(manifest, slug) == ver:
+    solo_linux = app['platforms'] == ['linux']       # S-658: Linux atrasada; Windows ya publicada y con tag
+    if publicada(manifest, slug, 'linux-x64' if solo_linux else 'windows-x64') == ver:
         p.update(accion='nada', motivo=f'la {ver} ya está publicada en el manifest')
         return p
     p['crear_tag'] = not tag_existe

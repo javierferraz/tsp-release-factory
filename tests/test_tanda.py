@@ -114,3 +114,13 @@ def test_notas(tmp_path, capsys):
     assert json.loads((tmp_path / 'rn.json').read_text()) == NOTAS
     assert tanda.main(['notas-seco', '--plan', str(f)]) == 0
     assert json.loads(capsys.readouterr().out) == {'snappy-wasp': NOTAS}
+
+
+def test_plan_solo_linux_compara_con_linux_y_no_toca_windows():
+    app = dict(tanda_de()['apps'][0], version='1.6.2', platforms=['linux'])
+    m = {'tools': [{'tool': 'snappy-wasp', 'platforms': {'windows-x64': {'version': '1.6.2'},
+                                                         'linux-x64': {'version': '1.6.0'}}}]}
+    x = tanda.plan(tanda_de(apps=[app]), m, lambda r, t: (True, {'snappy-wasp-v1.6.2-windows-x64-setup.exe'}), LUNES)['apps'][0]
+    assert (x['accion'], x['crear_tag'], x['build_windows'], x['build_linux']) == ('publicar', False, False, True)
+    m['tools'][0]['platforms']['linux-x64']['version'] = '1.6.2'
+    assert tanda.plan(tanda_de(apps=[app]), m, lambda r, t: (True, set()), LUNES)['apps'][0]['accion'] == 'nada'
