@@ -349,6 +349,7 @@ def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path):
 class _Rep:
     def __init__(self):
         self.avisos = []
+        self.main_sin_subir = False
 
 
 def _g(cwd, *args):
@@ -425,5 +426,6 @@ def test_push_choque_real_para_y_deja_el_clon_limpio(tmp_path):
     with pytest.raises(Fallo, match='a mano'):
         publish.push(fab, base, rep, espera=0)
     assert any('CRITICO' in a for a in rep.avisos)
+    assert rep.main_sin_subir is True   # el cierre de la tanda lo convierte en aviso
     assert _g(fab, 'status', '--porcelain').strip() == ''
     assert _g(origin, 'log', '-1', '--format=%s', 'main').strip() == 'choque'

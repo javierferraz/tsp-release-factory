@@ -499,6 +499,7 @@ class Informe:
         self.avisos = []
         self.real_fallaria = []
         self.hasta = 'inicio'
+        self.main_sin_subir = False   # FTP publicado y main con el manifest viejo
 
     def app(self, slug, **kw):
         self.apps.setdefault(slug, {'app': slug, 'estado': 'pendiente', 'comprobaciones': []}).update(kw)
@@ -1020,10 +1021,12 @@ def push(central, base, rep, intentos=PUSH_INTENTOS, espera=10):
         a = git(central, 'apply', '--3way', '--index', str(parche), check=False)
         if a.returncode != 0:
             git(central, 'reset', '-q', '--hard', 'FETCH_HEAD')
+            rep.main_sin_subir = True
             raise Fallo('el push a main se rechazo y el parche no aplica sobre main ni a 3 vias: hay que subir '
                         'el commit a mano (el parche va en los artefactos del run)')
         git(central, '-c', 'user.name=tsp-release-factory',
             '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-q', '-m', msg)
+    rep.main_sin_subir = True
     raise Fallo(f'el push a main se rechazo {intentos} veces ({ultimo[0]}): hay que subir el commit a mano '
                 '(el parche va en los artefactos del run)')
 
@@ -1053,7 +1056,7 @@ def write_summary(rep, plans, args, t0, md_path, json_path):
     lines += [f'| {p} | {e} | {d} |' for p, e, d in rep.pasos]
     result = {'modo': 'seco' if rep.seco else 'real', 'hasta': rep.hasta, 'minutos_publish': round(elapsed, 1),
               'minutos_job': round(job_min, 1) if job_min else None, 'apps': [], 'avisos': rep.avisos,
-              'en_real_fallaria': rep.real_fallaria}
+              'en_real_fallaria': rep.real_fallaria, 'main_sin_subir': rep.main_sin_subir}
     for slug, a in rep.apps.items():
         plan = plans.get(slug, {})
         lines += ['', f"### {slug} {plan.get('version', '')}: {a['estado']}"]
