@@ -982,22 +982,50 @@ def commit(central, apps_done, partial):
     return paths
 
 
-def push(central, base, rep):
-    p = git_auth(central, 'push', 'origin', 'HEAD:main', check=False)
-    if p.returncode == 0:
-        return
-    git_auth(central, 'fetch', 'origin', 'main')
-    upstream_manifest = git(central, 'diff', '--quiet', base, 'FETCH_HEAD', '--', 'updates/manifest.json',
-                            check=False).returncode != 0
-    r = git(central, 'rebase', 'FETCH_HEAD', check=False)
-    if r.returncode != 0:
+PUSH_INTENTOS = 6
+
+
+def push(central, base, rep, intentos=PUSH_INTENTOS, espera=10):
+    """Sube el commit de la tanda a main aunque otras sesiones esten subiendo a la vez.
+
+    Con el FTP ya publicado, quedarse sin subir deja main con el manifest viejo y la siguiente
+    publicacion lo revertiria (2026-11-16: el rebase choco y la tanda paro). Por eso reintenta:
+    rebase sobre main fresco y, si choca, rehace el commit aplicando el parche a 3 vias.
+    """
+    msg = git(central, 'log', '-1', '--format=%B').stdout
+    parche = Path(central).parent / f'tanda-push-{os.getpid()}.diff'
+    # En bytes: el modo texto de run() cambia los \r\n y el parche de un fichero CRLF no aplicaria
+    parche.write_bytes(subprocess.run(['git', '-C', str(central), 'diff', '--binary', base, 'HEAD'],
+                                      capture_output=True, check=True).stdout)
+    avisado = False
+    ultimo = ''
+    for intento in range(intentos):
+        p = git_auth(central, 'push', 'origin', 'HEAD:main', check=False)
+        if p.returncode == 0:
+            if intento:
+                rep.avisos.append(f'el push a main entro al intento {intento + 1} (otras sesiones subian a la vez)')
+            return
+        ultimo = ((p.stdout or '') + (p.stderr or '')).strip().splitlines()[-1:] or ['']
+        time.sleep(espera * (intento + 1))
+        git_auth(central, 'fetch', 'origin', 'main')
+        if not avisado and git(central, 'diff', '--quiet', base, 'FETCH_HEAD', '--', 'updates/manifest.json',
+                               check=False).returncode != 0:
+            avisado = True
+            rep.avisos.append('CRITICO: otra sesion cambio updates/manifest.json en main mientras se publicaba; '
+                              'el manifest del FTP no lleva ese cambio: hay que volver a firmarlo y subirlo')
+        if git(central, 'rebase', 'FETCH_HEAD', check=False).returncode == 0:
+            continue
         git(central, 'rebase', '--abort', check=False)
-        raise Fallo('el push a main se rechazo y el rebase choca: hay que subir el commit a mano '
-                    '(el parche va en los artefactos del run)')
-    if upstream_manifest:
-        rep.avisos.append('CRITICO: otra sesion cambio updates/manifest.json en main mientras se publicaba; '
-                          'el manifest del FTP no lleva ese cambio: hay que volver a firmarlo y subirlo')
-    git_auth(central, 'push', 'origin', 'HEAD:main')
+        git(central, 'reset', '-q', '--hard', 'FETCH_HEAD')
+        a = git(central, 'apply', '--3way', '--index', str(parche), check=False)
+        if a.returncode != 0:
+            git(central, 'reset', '-q', '--hard', 'FETCH_HEAD')
+            raise Fallo('el push a main se rechazo y el parche no aplica sobre main ni a 3 vias: hay que subir '
+                        'el commit a mano (el parche va en los artefactos del run)')
+        git(central, '-c', 'user.name=tsp-release-factory',
+            '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '-q', '-m', msg)
+    raise Fallo(f'el push a main se rechazo {intentos} veces ({ultimo[0]}): hay que subir el commit a mano '
+                '(el parche va en los artefactos del run)')
 
 
 def seed_site_manifest(central, mock):

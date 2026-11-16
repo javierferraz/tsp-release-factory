@@ -342,3 +342,88 @@ def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path):
     finally:
         mock.stop()
     assert not (central / 'credentials.json').exists()
+
+
+# ── push a main con otras sesiones subiendo a la vez (2026-11-16) ──
+
+class _Rep:
+    def __init__(self):
+        self.avisos = []
+
+
+def _g(cwd, *args):
+    import subprocess
+    return subprocess.run(['git', '-C', str(cwd), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def _clones(tmp_path):
+    """origin desnudo + clon 'fabrica' con su commit de tanda + clon 'otra' sesion."""
+    origin = tmp_path / 'origin.git'
+    _g(tmp_path, 'init', '-q', '--bare', '-b', 'main', str(origin))
+    fab = tmp_path / 'fabrica'
+    _g(tmp_path, 'clone', '-q', str(origin), str(fab))
+    (fab / 'updates').mkdir()
+    (fab / 'updates' / 'manifest.json').write_text('{"v": 1}\n', encoding='utf-8')
+    (fab / 'news.html').write_text(''.join(f'linea {i}\n' for i in range(20)), encoding='utf-8')
+    _g(fab, 'add', '.')
+    _g(fab, 'commit', '-q', '-m', 'inicio')
+    _g(fab, 'push', '-q', 'origin', 'HEAD:main')
+    base = _g(fab, 'rev-parse', 'HEAD').strip()
+    otra = tmp_path / 'otra'
+    _g(tmp_path, 'clone', '-q', str(origin), str(otra))
+    (fab / 'updates' / 'manifest.json').write_text('{"v": 2}\n', encoding='utf-8')
+    texto = (fab / 'news.html').read_text(encoding='utf-8').replace('linea 0\n', 'linea 0\nNOVEDAD\n')
+    (fab / 'news.html').write_text(texto, encoding='utf-8')
+    _g(fab, 'commit', '-q', '-am', 'release: tanda')
+    return origin, fab, otra, base
+
+
+def test_push_reintenta_si_otra_sesion_subio_antes(tmp_path):
+    origin, fab, otra, base = _clones(tmp_path)
+    (otra / 'otro.txt').write_text('x\n', encoding='utf-8')
+    _g(otra, 'add', '.')
+    _g(otra, 'commit', '-q', '-m', 'otra sesion')
+    _g(otra, 'push', '-q', 'origin', 'HEAD:main')
+    rep = _Rep()
+    publish.push(fab, base, rep, espera=0)
+    log = _g(origin, 'log', '--format=%s', 'main')
+    assert log.splitlines()[:2] == ['release: tanda', 'otra sesion']
+    assert any('intento 2' in a for a in rep.avisos)
+    assert not any('CRITICO' in a for a in rep.avisos)
+
+
+def test_push_rehace_el_commit_con_el_parche_si_el_rebase_choca(tmp_path, monkeypatch):
+    origin, fab, otra, base = _clones(tmp_path)
+    (otra / 'news.html').write_text((otra / 'news.html').read_text(encoding='utf-8')
+                                    .replace('linea 19\n', 'linea 19 sellada\n'), encoding='utf-8')
+    _g(otra, 'commit', '-q', '-am', 'otra sesion toca news')
+    _g(otra, 'push', '-q', 'origin', 'HEAD:main')
+    real = publish.git
+
+    def git_rebase_falla(central, *args, check=True):
+        if args and args[0] == 'rebase' and args[1] != '--abort':
+            return real(central, 'rebase', 'no-existe-esta-ref', check=False)
+        return real(central, *args, check=check)
+
+    monkeypatch.setattr(publish, 'git', git_rebase_falla)
+    publish.push(fab, base, _Rep(), espera=0)
+    news = _g(origin, 'show', 'main:news.html')
+    assert 'NOVEDAD' in news and 'linea 19 sellada' in news
+    assert _g(origin, 'show', 'main:updates/manifest.json') == '{"v": 2}\n'
+    assert _g(origin, 'log', '-1', '--format=%s', 'main').strip() == 'release: tanda'
+
+
+def test_push_choque_real_para_y_deja_el_clon_limpio(tmp_path):
+    origin, fab, otra, base = _clones(tmp_path)
+    (otra / 'news.html').write_text((otra / 'news.html').read_text(encoding='utf-8')
+                                    .replace('linea 0\n', 'linea 0\nOTRA COSA\n'), encoding='utf-8')
+    (otra / 'updates' / 'manifest.json').write_text('{"v": 9}\n', encoding='utf-8')
+    _g(otra, 'commit', '-q', '-am', 'choque')
+    _g(otra, 'push', '-q', 'origin', 'HEAD:main')
+    rep = _Rep()
+    with pytest.raises(Fallo, match='a mano'):
+        publish.push(fab, base, rep, espera=0)
+    assert any('CRITICO' in a for a in rep.avisos)
+    assert _g(fab, 'status', '--porcelain').strip() == ''
+    assert _g(origin, 'log', '-1', '--format=%s', 'main').strip() == 'choque'
