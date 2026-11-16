@@ -302,8 +302,10 @@ def _port_free(port):
 
 @pytest.mark.skipif(_central() is None, reason='sin el repo central (TSP_CENTRAL)')
 @pytest.mark.skipif(not _port_free(21), reason='puerto 21 ocupado o sin permiso (en Linux: ip_unprivileged_port_start)')
-def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path):
+def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path, monkeypatch):
     pytest.importorskip('pyftpdlib')
+    # el manifest de prueba solo trae «demo»: frente al publicado de verdad retrocederia (S-1069)
+    monkeypatch.setenv('TSP_MANIFEST_RETROCEDE_OK', '1')
     central = tmp_path / 'central'
     shutil.copytree(_central() / 'scripts', central / 'scripts',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
