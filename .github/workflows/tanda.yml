@@ -6,7 +6,8 @@
 # Sin «sí» en 24 h la tanda caduca: scripts/tanda.py plan la rechaza.
 #
 # Por cada app lista:
-#   1. Si falta el tag: sube la versión, sella el CHANGELOG, commit y tag vX.Y.Z en su repo.
+#   1. Si falta el tag: integra las ramas «Rama: terminada» de la tanda (R11), sube la versión,
+#      sella el CHANGELOG, commit y tag vX.Y.Z en su repo, y borra las ramas integradas.
 #   2. Construye en esta fábrica lo que la Release aún no tenga: Windows y después Linux (una a una
 #      para que no compitan al crear la Release).
 #   3. Sube release-notes.json (las notas en inglés de la tanda) a la Release.
@@ -114,6 +115,14 @@ jobs:
             if [ "$(get crear_tag)" = true ]; then
               dir="$RUNNER_TEMP/app-$app"
               git clone -q "https://x-access-token:${GH_TOKEN}@github.com/$repo.git" "$dir"                 || { fuera "no pude clonar $repo"; continue; }
+              # R11: las ramas «Rama: terminada» de la tanda entran en la principal antes de sellar
+              integradas=""
+              if [ "$(jq ".apps[$i].ramas // [] | length" "$plan")" != 0 ]; then
+                if ! integradas=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" integrar --dir . --plan "$plan" --app "$app"); then
+                  fuera "no pude integrar sus ramas terminadas (${integradas#::error::})"; continue
+                fi
+                [ -z "$integradas" ] || resumen "$app $ver: ramas integradas en la principal: $integradas"
+              fi
               if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)"); then
                 fuera "no pude subir la versión o sellar el CHANGELOG"; continue
               fi
@@ -132,6 +141,15 @@ jobs:
                 fuera "no pude subir el commit y el tag"; continue
               fi
               resumen "$app $ver: versión subida, CHANGELOG sellado y tag $tag creado"
+              for rama in $integradas; do   # ya están en la principal: se borran si nadie las movió después
+                sha=$(jq -r --arg r "$rama" ".apps[$i].ramas[] | select(.rama == \$r) | .sha" "$plan")
+                remoto=$(cd "$dir" && git ls-remote origin "refs/heads/$rama" | cut -f1)
+                if [ "$remoto" = "$sha" ] && ( cd "$dir" && git push -q origin --delete "$rama" ); then
+                  resumen "$app $ver: rama $rama borrada (ya está en la principal)"
+                else
+                  resumen "$app $ver: rama $rama no se borra (se movió después de la tanda o no pude)"
+                fi
+              done
             fi
 
             # 2. Builds (Windows y despues Linux)

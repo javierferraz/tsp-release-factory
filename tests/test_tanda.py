@@ -124,3 +124,81 @@ def test_plan_solo_linux_compara_con_linux_y_no_toca_windows():
     assert (x['accion'], x['crear_tag'], x['build_windows'], x['build_linux']) == ('publicar', False, False, True)
     m['tools'][0]['platforms']['linux-x64']['version'] = '1.6.2'
     assert tanda.plan(tanda_de(apps=[app]), m, lambda r, t: (True, set()), LUNES)['apps'][0]['accion'] == 'nada'
+
+
+# ----------------------------- R11: integrar ramas terminadas ------------------------------
+
+def test_plan_arrastra_las_ramas_solo_si_crea_el_tag():
+    t = tanda_de()
+    t['apps'][0]['ramas'] = [{'rama': 's1200', 'sha': 'f' * 40, 'extra': 'x'}]
+    x = tanda.plan(t, MANIFEST, lambda r, g: (False, set()), LUNES)['apps'][0]
+    assert x['ramas'] == [{'rama': 's1200', 'sha': 'f' * 40}]
+    x = tanda.plan(t, MANIFEST, lambda r, g: (True, set()), LUNES)['apps'][0]
+    assert 'ramas' not in x
+    assert 'ramas' not in tanda.plan(tanda_de(), MANIFEST, lambda r, g: (False, set()), LUNES)['apps'][0]
+
+
+@pytest.fixture
+def clon(tmp_path, monkeypatch):
+    """Un repo con origin y las ramas: lista, notas (choca solo en el CHANGELOG) y choca (en código)."""
+    import subprocess
+    for k, v in {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                 'GIT_COMMITTER_EMAIL': 't@t', 'GIT_CONFIG_NOSYSTEM': '1'}.items():
+        monkeypatch.setenv(k, v)
+
+    def g(*args, cwd=None):
+        r = subprocess.run(['git', *args], cwd=cwd or repo, capture_output=True, text=True)
+        assert r.returncode == 0, (args, r.stderr)
+        return r.stdout.strip()
+
+    def commit(f, txt, msg):
+        (repo / f).write_text(txt, encoding='utf-8')
+        g('add', f)
+        g('commit', '-q', '-m', msg)
+
+    origin, repo = tmp_path / 'o.git', tmp_path / 'app'
+    g('init', '-q', '--bare', '-b', 'main', str(origin), cwd=tmp_path)
+    g('clone', '-q', str(origin), str(repo), cwd=tmp_path)
+    g('checkout', '-q', '-b', 'main')
+    commit('a.txt', 'uno\n', 'inicio')
+    commit('CHANGELOG.md', '## [Unreleased]\n\n## [1.0.0]\n', 'notas')
+    shas = {}
+    for rama, (f, txt) in {'lista': ('b.txt', 'b\n'),
+                           'notas': ('CHANGELOG.md', '## [Unreleased]\n- de la rama\n\n## [1.0.0]\n'),
+                           'choca': ('a.txt', 'dos\n')}.items():
+        g('checkout', '-q', '-b', rama, 'main')
+        commit(f, txt, f'{rama}\n\nRama: terminada')
+        shas[rama] = g('rev-parse', 'HEAD')
+    g('checkout', '-q', 'main')
+    commit('a.txt', 'tres\n', 'main avanza')
+    commit('CHANGELOG.md', '## [Unreleased]\n- de main\n\n## [1.0.0]\n', 'nota de main')
+    return repo, shas, g
+
+
+def test_integrar_une_notas_y_deja_la_principal_lista(clon):
+    repo, shas, g = clon
+    hechas = tanda.integrar(repo, [{'rama': 'lista', 'sha': shas['lista']}, {'rama': 'notas', 'sha': shas['notas']}],
+                            'tanda 2026-11-19')
+    assert hechas == ['lista', 'notas']
+    assert (repo / 'b.txt').exists()
+    assert (repo / 'CHANGELOG.md').read_text(encoding='utf-8') == '## [Unreleased]\n- de main\n- de la rama\n\n## [1.0.0]\n'
+    assert g('status', '--porcelain') == '' and g('log', '-1', '--format=%s') == 'Integra notas (tanda 2026-11-19)'
+    assert tanda.integrar(repo, [{'rama': 'lista', 'sha': shas['lista']}], 'otra') == []   # ya dentro
+
+
+def test_integrar_conflicto_de_codigo_deja_fuera_sin_tocar(clon):
+    repo, shas, g = clon
+    antes = g('rev-parse', 'HEAD')
+    with pytest.raises(tanda.Fallo, match='choca con la principal en a.txt'):
+        tanda.integrar(repo, [{'rama': 'choca', 'sha': shas['choca']}], 'tanda')
+    assert g('rev-parse', 'HEAD') == antes and g('status', '--porcelain') == ''
+
+
+@pytest.mark.parametrize('rama,sha,texto', [
+    ('x; rm -rf /', 'f' * 40, 'no válida'),
+    ('lista', 'zz', 'no válida'),
+    ('lista', '0' * 40, 'ya no tiene el commit'),
+])
+def test_integrar_rechaza_entradas_malas(clon, rama, sha, texto):
+    with pytest.raises(tanda.Fallo, match=texto):
+        tanda.integrar(clon[0], [{'rama': rama, 'sha': sha}], 'tanda')

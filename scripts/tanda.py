@@ -12,11 +12,16 @@ clic es el «sí». Este script:
   sellar   en una copia del repo de la app: sube la versión en los ficheros de su stack y sella
            el [Unreleased] del CHANGELOG como «## [X.Y.Z] — fecha». El commit, el tag y el push los
            hace el workflow (y solo de verdad, no en el ensayo).
+  integrar (R11) en el clon, antes de sellar: fusiona en la principal las ramas «Rama: terminada»
+           que el vigía metió en la tanda (por su sha). Un conflicto solo en CHANGELOG/CONTEXT se
+           une; otro deja la app fuera. Imprime las ramas integradas (el workflow las borra
+           después del push si nadie las movió).
   notas    escribe el release-notes.json de una app (lo que publish.py lee de la Release).
   notas-seco  las notas de todas las apps del plan en un JSON {slug: {...}} para publish.yml en seco.
 
 Uso:
   python scripts/tanda.py plan [--fecha AAAA-MM-DD] --out DIR
+  python scripts/tanda.py integrar --dir DIR --plan FICHERO --app SLUG
   python scripts/tanda.py sellar --dir DIR --version X.Y.Z --stack tauri|pyside [--fecha AAAA-MM-DD]
   python scripts/tanda.py notas --plan FICHERO --app SLUG --out FICHERO
   python scripts/tanda.py notas-seco --plan FICHERO
@@ -94,6 +99,8 @@ def plan_app(app, manifest, tag_existe, assets):
         p.update(accion='nada', motivo=f'la {ver} ya está publicada en el manifest')
         return p
     p['crear_tag'] = not tag_existe
+    if app.get('ramas') and p['crear_tag']:          # R11: con el tag ya hecho, ya no se integra nada
+        p['ramas'] = [{'rama': r['rama'], 'sha': r['sha']} for r in app['ramas']]
     p['build_windows'] = 'windows' in app['platforms'] and f'{slug}-v{ver}-windows-x64-setup.exe' not in assets
     p['build_linux'] = 'linux' in app['platforms'] and f'{slug}-v{ver}-linux-x64.AppImage' not in assets
     p['accion'] = 'publicar'
@@ -182,6 +189,64 @@ def sellar_changelog(d, version, fecha):
     return True
 
 
+# ----------------------------- integrar (R11) ---------------------------------
+# Las ramas marcadas «Rama: terminada» que el vigía metió en la tanda se fusionan en la principal
+# del clon antes de sellar. Un conflicto solo en las notas (cada rama añade su línea en el mismo
+# sitio) se resuelve uniendo las dos versiones; cualquier otro deja la app fuera, sin tocar nada.
+
+NOTAS = {'CHANGELOG.md', 'CONTEXT.md'}
+RAMA_OK = re.compile(r'[A-Za-z0-9._/-]+')
+
+
+def _git(d, *args, check=True, **kw):
+    r = subprocess.run(['git', *args], cwd=d, capture_output=True, text=True, encoding='utf-8', **kw)
+    if check and r.returncode != 0:
+        raise Fallo(f'git {" ".join(args[:2])}: {(r.stderr or r.stdout).strip()[:300]}')
+    return r
+
+
+def _unir_notas(d, f):
+    """Conflicto en una nota: las líneas de la principal y después las de la rama, sin perder ninguna."""
+    partes = {}
+    for n, nombre in ((1, 'base'), (2, 'nuestra'), (3, 'suya')):
+        r = _git(d, 'show', f':{n}:{f}', check=False)
+        partes[nombre] = r.stdout if r.returncode == 0 else ''
+    tmp = Path(d) / '.git' / 'r11-union'
+    tmp.mkdir(exist_ok=True)
+    for nombre, texto in partes.items():
+        (tmp / nombre).write_bytes(texto.encode('utf-8'))
+    r = _git(d, 'merge-file', '-p', '--union', str(tmp / 'nuestra'), str(tmp / 'base'), str(tmp / 'suya'), check=False)
+    if r.returncode < 0:
+        raise Fallo(f'no pude unir {f}')
+    (Path(d) / f).write_bytes(r.stdout.encode('utf-8'))
+    _git(d, 'add', '--', f)
+
+
+def integrar(d, ramas, etiqueta):
+    """Fusiona cada rama (por su sha de la tanda: si alguien la movió después, entra lo revisado) en
+    la rama actual del clon. Devuelve las ramas integradas. Fallo si alguna choca en código."""
+    hechas = []
+    for r in ramas:
+        rama, sha = r['rama'], r['sha']
+        if not RAMA_OK.fullmatch(rama) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+            raise Fallo(f'rama no válida en la tanda: {rama!r}')
+        if _git(d, 'cat-file', '-e', f'{sha}^{{commit}}', check=False).returncode:
+            raise Fallo(f'la rama {rama} ya no tiene el commit {sha[:9]} de la tanda')
+        if _git(d, 'merge-base', '--is-ancestor', sha, 'HEAD', check=False).returncode == 0:
+            continue                                            # ya estaba dentro
+        m = _git(d, 'merge', '--no-ff', '--no-edit', '-m', f'Integra {rama} ({etiqueta})', sha, check=False)
+        if m.returncode:
+            choques = _git(d, 'diff', '--name-only', '--diff-filter=U').stdout.split()
+            if not choques or any(Path(f).name not in NOTAS for f in choques):
+                _git(d, 'merge', '--abort', check=False)
+                raise Fallo(f'la rama {rama} choca con la principal en {", ".join(choques[:3]) or "?"}')
+            for f in choques:
+                _unir_notas(d, f)
+            _git(d, 'commit', '--no-edit', '-q')
+        hechas.append(rama)
+    return hechas
+
+
 # ----------------------------- notas ------------------------------------------
 
 def notas_de(p):
@@ -205,6 +270,10 @@ def main(argv=None):
     n.add_argument('--out', type=Path, required=True)
     ns = sub.add_parser('notas-seco')
     ns.add_argument('--plan', type=Path, required=True)
+    ig = sub.add_parser('integrar')
+    ig.add_argument('--dir', type=Path, required=True)
+    ig.add_argument('--plan', type=Path, required=True)
+    ig.add_argument('--app', required=True)
     args = ap.parse_args(argv)
     try:
         if args.orden == 'plan':
@@ -216,12 +285,18 @@ def main(argv=None):
             (args.out / 'plan.json').write_text(json.dumps(p, ensure_ascii=False, indent=2), encoding='utf-8')
             for x in p['apps']:
                 que = x.get('motivo') or ', '.join(k for k in ('crear_tag', 'build_windows', 'build_linux') if x.get(k)) or 'solo publicar'
+                if x.get('ramas'):
+                    que += ', integra ' + ' '.join(r['rama'] for r in x['ramas'])
                 print(f'{x["app"]} {x["version"]}: {que}')
         elif args.orden == 'sellar':
             tocados = subir_version(args.dir, args.stack, args.version)
             if sellar_changelog(args.dir, args.version, args.fecha):
                 tocados.append('CHANGELOG.md')
             print(' '.join(tocados))
+        elif args.orden == 'integrar':
+            pl = json.loads(args.plan.read_text(encoding='utf-8'))
+            p = next(x for x in pl['apps'] if x['app'] == args.app)
+            print(' '.join(integrar(args.dir, p.get('ramas') or [], f'tanda {pl["fecha"]}')))
         elif args.orden == 'notas':
             p = next(x for x in json.loads(args.plan.read_text(encoding='utf-8'))['apps'] if x['app'] == args.app)
             args.out.write_text(json.dumps(notas_de(p), ensure_ascii=False) + '\n', encoding='utf-8')
