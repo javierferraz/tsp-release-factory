@@ -164,7 +164,10 @@ jobs:
           # .spec
           $specs = @(Get-ChildItem -File -Filter '*.spec')
           if ($specs.Count -ne 1) { throw "Se esperaba 1 .spec en la raiz y hay $($specs.Count)" }
-          $name = $specs[0].BaseName
+          # Nombre del programa = el name='...' del EXE/COLLECT del .spec (S-658: Tappy lo llama
+          # tappy-woodpecker aunque su .spec sea TappyWoodpecker.spec); si no lo trae, el del fichero.
+          $nm = [regex]::Matches((Get-Content $specs[0].FullName -Raw), "(?m)^\s*name\s*=\s*['""]([^'""]+)['""]")
+          $name = if ($nm.Count -gt 0) { $nm[$nm.Count - 1].Groups[1].Value } else { $specs[0].BaseName }
 
           # Python del build: el que dice requirements-build.txt
           if (-not (Test-Path requirements-build.txt)) { throw 'Falta requirements-build.txt (freeze exacto del build)' }
