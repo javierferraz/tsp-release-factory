@@ -2,3 +2,6 @@
 # en el job de Windows (factura el doble) en lugar del de ubuntu. Una por linea: slug y motivo.
 # Sacar la app de la lista en cuanto el motivo se arregle en su repo.
 snappy-wasp  # tests/test_activity_notice.py: 2 tests usan workers.hotkey_listener._Win32Hotkey, que solo existe en Win32, sin skipif (run 41355080191)
+sneaky-spider  # tests/test_prefs.py y test_audit_history.py usan rutas de Windows (C:\exports, SneakySpider\audit_history.json) (run 45027616335, S-658)
+handy-raccoon  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027619064, S-658)
+tappy-woodpecker  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027621778, S-658)
