@@ -196,7 +196,9 @@ jobs:
           "TS_DLIB=$dlib" >> $env:GITHUB_ENV
           "TS_METADATA=$env:GITHUB_WORKSPACE\factory\signing\metadata.json" >> $env:GITHUB_ENV
           # signCommand de la fabrica, sin rutas del portatil y sin tocar el repo de la app.
-          $override = @{ bundle = @{ windows = @{ signCommand = "$env:GITHUB_WORKSPACE\factory\signing\sign.cmd %1" } } }
+          # createUpdaterArtifacts=false (S-658): Cat y Greenjay lo llevan a true y Tauri pediria la clave
+          # privada durante el build; el .sig se genera mas abajo con la clave de la app.
+          $override = @{ bundle = @{ createUpdaterArtifacts = $false; windows = @{ signCommand = "$env:GITHUB_WORKSPACE\factory\signing\sign.cmd %1" } } }
           $override | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'factory.tauri.conf.json') -Encoding utf8
           "| Firma | signtool $($signtool.Directory.Parent.Name), Trusted Signing client $env:TS_CLIENT_VERSION (hash comprobado) |" >> $env:REPORT
 
