@@ -352,6 +352,24 @@ def planned_block(fmt):
             'format': fmt, 'notes': None, 'installer_size': None, 'portable_size': None}
 
 
+def entrada_de_partida(actual, vieja, plats):
+    """(en seco, --entrada-previa) La entrada actual con SOLO las plataformas de la tanda como
+    estaban en `vieja`. Las demas se quedan como estan publicadas: si volvieran atras,
+    manifest_guard.py pararia la subida simulada por ir por detras del manifest en vivo (S-1275)."""
+    out = json.loads(json.dumps(actual))
+    for p in plats:
+        key = {'windows': 'windows-x64', 'linux': 'linux-x64'}[p]
+        if key in (vieja.get('platforms') or {}):
+            out['platforms'][key] = json.loads(json.dumps(vieja['platforms'][key]))
+        else:
+            out['platforms'].pop(key, None)
+    if 'windows' in plats:      # apply_plan las vuelve a poner con la version nueva
+        for k in ('version', 'release_date'):
+            if k in vieja:
+                out[k] = vieja[k]
+    return out
+
+
 def apply_plan(manifest, plan, today):
     """Aplica a manifest (en memoria) lo que el plan publica. Devuelve la entrada resultante."""
     tools = manifest.setdefault('tools', [])
@@ -1324,7 +1342,9 @@ def main(argv=None):
                 git_auth(central, 'fetch', '-q', '--depth=1', 'origin', rev)   # el checkout es de profundidad 1
             old = json.loads(git(central, 'show', f'{rev}:updates/manifest.json').stdout)
             old_entry = next(t for t in old['tools'] if t['tool'] == slug)
-            manifest['tools'] = [old_entry if t['tool'] == slug else t for t in manifest['tools']]
+            plats = next((s['platforms'] for s in apps if s['app'] == slug), [])
+            manifest['tools'] = [entrada_de_partida(t, old_entry, plats) if t['tool'] == slug else t
+                                 for t in manifest['tools']]
             write_json(manifest_path, manifest)
             git(central, '-c', 'user.name=dry-run', '-c', 'user.email=dry-run@localhost', 'commit', '-q',
                 '-m', f'[en seco] {slug} como en {rev}', '--', 'updates/manifest.json')

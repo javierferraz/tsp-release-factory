@@ -346,6 +346,22 @@ def test_json_roto_de_la_release_no_tumba_la_tanda(tmp_path):
     assert publish.informe_visual([1], 'v.json')['estado'] == 'ilegible'
 
 
+def test_entrada_de_partida_solo_cambia_las_plataformas_de_la_tanda():
+    # Run real del 2026-11-23: con la entrada vieja entera, Linux volvia a 1.6.3 y
+    # manifest_guard paraba la subida simulada por ir por detras del manifest en vivo.
+    def entry(w, l, v):
+        return {'tool': 'demo', 'version': v, 'release_date': f'd{v}',
+                'platforms': {'windows-x64': {'version': w}, 'linux-x64': {'version': l}}}
+    actual, vieja = entry('1.7.0', '1.7.0', '1.7.0'), entry('1.6.3', '1.6.3', '1.6.3')
+    out = publish.entrada_de_partida(actual, vieja, ['windows'])
+    assert out['platforms'] == {'windows-x64': {'version': '1.6.3'}, 'linux-x64': {'version': '1.7.0'}}
+    assert out['version'] == '1.6.3' and actual['platforms']['windows-x64']['version'] == '1.7.0'
+    out = publish.entrada_de_partida(actual, vieja, ['linux'])
+    assert out['platforms']['windows-x64']['version'] == '1.7.0' and out['version'] == '1.7.0'
+    sin_linux = {**vieja, 'platforms': {'windows-x64': {'version': '1.6.3'}}}
+    assert 'linux-x64' not in publish.entrada_de_partida(actual, sin_linux, ['linux'])['platforms']
+
+
 def test_parse_autorizacion():
     assert publish.parse_autorizacion('') == {}
     assert publish.parse_autorizacion(json.dumps(AUT)) == AUT
