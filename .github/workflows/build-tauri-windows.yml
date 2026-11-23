@@ -242,6 +242,10 @@ jobs:
 
           # .sig del actualizador (minisign) con la clave de la app. La clave va a un fichero
           # temporal del runner, nunca al log ni a un artefacto, y se borra al acabar el job.
+          # RAMA DE PRUEBA S-1276 (no se fusiona): Clear Parrot no tiene su clave en la fabrica.
+          $sinSig = [string]::IsNullOrWhiteSpace($env:TAURI_KEY_CONTENT) -and $env:TAG -like '*-factory-test'
+          if ($sinSig) { "| .sig del actualizador | RAMA DE PRUEBA S-1276: no hay $env:KEY_NAME en la fabrica, sin .sig |" >> $env:REPORT }
+          if (-not $sinSig) {
           if ([string]::IsNullOrWhiteSpace($env:TAURI_KEY_CONTENT)) { throw "El secreto $env:KEY_NAME esta vacio o no existe" }
           $key = Join-Path $env:RUNNER_TEMP 'tauri-updater.key'
           [IO.File]::WriteAllText($key, $env:TAURI_KEY_CONTENT.Trim())
@@ -258,6 +262,7 @@ jobs:
           python "$env:GITHUB_WORKSPACE\factory\scripts\verify_minisign.py" $setup "$setup.sig" $pubkey
           if ($LASTEXITCODE -ne 0) { throw 'El .sig no verifica con la pubkey de tauri.conf.json' }
           '| .sig del actualizador | verificado con la pubkey de tauri.conf.json |' >> $env:REPORT
+          }
 
           $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText((Join-Path $env:OUT 'SHA256SUMS.txt'), "$sha *$($env:ASSET)`n")
@@ -318,6 +323,7 @@ jobs:
             scripts/ui_fit
           sparse-checkout-cone-mode: false
           persist-credentials: false
+          ref: s1276   # RAMA DE PRUEBA S-1276: el central aún no tiene el modo --instalada en main
 
       - name: Render real (nivel 2) e informe visual
         continue-on-error: true
@@ -401,7 +407,8 @@ jobs:
           $clash = @($names | Where-Object { $_ -in (@($env:ASSET, "$env:ASSET.sig", 'SHA256SUMS.txt', $env:PRUEBAS) + $visual) })
           if ($clash.Count) { throw "La Release ya tiene: $($clash -join ', '). No se pisan." }
           Push-Location $env:OUT
-          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET "$env:ASSET.sig" SHA256SUMS.txt $env:PRUEBAS @visual
+          $sig = @("$env:ASSET.sig" | Where-Object { Test-Path $_ })   # RAMA DE PRUEBA S-1276
+          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET @sig SHA256SUMS.txt $env:PRUEBAS @visual
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw 'gh release upload falla' }
