@@ -189,6 +189,13 @@ jobs:
           idx=$(paste -sd, "$T/listas.txt")
           apps=$(jq -c "[.apps[$idx] | {app, repo, version, platforms}]" "$plan")
           args=(-f apps="$apps" -f dry_run="$DRY_RUN")
+          # El «sí» de Javier queda en la ficha de release (S-1275): quién lanzó esta tanda, cuándo y desde dónde.
+          inicio=$(GH_TOKEN=$FACTORY_TOKEN gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+          modo=$([ "$DRY_RUN" = true ] && echo ensayo || echo real)
+          args+=(-f autorizacion="$(jq -nc --arg q "$GITHUB_ACTOR" --arg c "$inicio" \
+            --arg t "Run workflow de la tanda ${FECHA:-(la última)} ($modo), desde el aviso [RELEASES]" \
+            --arg e "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{quien: $q, cuando: $c, texto: $t, ejecucion: $e}')")
           if [ "$DRY_RUN" = true ]; then
             args+=(-f notas_seco="$(jq -c "[.apps[$idx] | {key: .app, value: (.notas | with_entries(select(.key == \"windows\" or .key == \"linux\")))}] | from_entries" "$plan")")
           fi

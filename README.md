@@ -181,7 +181,9 @@ Todo lo hace `scripts/publish.py` con los scripts del repo central, como el fluj
 3. Entrada del manifest: Windows estable, Linux experimental, notas en inglés de
    `release-notes.json` de la Release; esquema con `validate_manifest.validate_schema`.
 4. `ftp_release.py --fabrica`: sube binarios, `SHA256SUMS` y el manifest firmado, **sin poda,
-   archivo en D: ni Sheets** (eso sigue siendo del portátil), y lo comprueba en una sesión FTP nueva.
+   archivo en D: ni Sheets** (eso sigue siendo del portátil), y lo comprueba en una sesión FTP nueva
+   (tamaño y SHA256 de cada binario, descargándolo otra vez). Solo sube con la ficha de release
+   publicable: ver abajo.
 5. `<app>-latest.json` de Tauri, `sync_fallback_hrefs.py`, entrada en `news/`, commit y push del
    central, `deploy_site.py` desde ese commit y `audit_releases.py --quick --sin-respaldo` de puerta.
 6. Release de prerelease a definitiva y resumen (Markdown en el run, JSON con texto para Telegram
@@ -215,6 +217,37 @@ desmarcado publica; por defecto es ensayo.
 En ensayo no hay push (solo `git push --dry-run`), ni tags, ni builds, y `publish.yml` corre en seco
 con las notas de la tanda (`notas_seco`). Ensayos verdes: run 43125982189 (R8) y 43211697628 (R9),
 los dos con Bright Cardinal 1.0.0.
+
+## Ficha de release y circuito de instalar, actualizar y desinstalar (S-1275, PAA2 P6-1)
+
+Desde la fábrica no se publica sin ficha: `ftp_release.py --fabrica` del central exige `--ficha`
+y que sea publicable según `docs/distribucion/ficha-obligatoria.json` del central (pruebas
+exigidas en «ok» o «no_aplica: motivo», informe visual en verde del mismo commit donde se exige).
+El circuito manual (sin `--fabrica`) no cambia.
+
+- **Build de Windows** (`build-*-windows.yml`), antes del smoke limpio: `scripts/anterior.py` busca
+  la versión anterior (la del manifest público si es menor; si no, la Release `vX.Y.Z` más alta por
+  debajo) y comprueba su SHA256; `scripts/smoke-update.ps1` instala la anterior, la abre y la cierra,
+  actualiza encima comprobando que sus ajustes (ficheros en `%APPDATA%`/`%LOCALAPPDATA%` y valores
+  de `HKCU\Software`) siguen iguales, abre la nueva, desinstala y deja el runner como estaba. Sin
+  versión anterior, la prueba queda «no_aplica». Al final, `scripts/pruebas_windows.py` deja
+  `<app>-v<ver>-windows-pruebas.json` en la Release (commit del tag, run y resultado de cada prueba).
+- **`publish.py`** arma la ficha (commit del tag, construcción, pruebas por plataforma, informe
+  visual, notas y el «sí»), excluye la app si no es publicable (en seco: «En real esto pararía»),
+  la pasa a `ftp_release.py --ficha` y sube la ficha final a la Release como `<app>-v<ver>-ficha.json`
+  (en seco queda en el artefacto `publish-<run>`, carpeta `fichas/`).
+- **El «sí»**: `tanda.yml` pasa quién lanzó la tanda, cuándo y el run (`autorizacion`). Lanzado a
+  mano, `publish.yml` apunta a quien lo lanzó.
+- **Lo que aún no hay**: pruebas de instalación en Linux (quedan «no_ejecutada» con motivo; Linux
+  no tiene pruebas exigidas) e informe visual (lo producirá P6-2 como
+  `<app>-v<ver>-informe-visual.json` con `estado`, `commit` y `medidas`). Clear Parrot lo tiene
+  exigido en Windows, así que hasta P6-2 solo se publica por el circuito manual.
+- **Releases construidas antes de esto** no traen el informe de pruebas: no se publican desde la
+  fábrica hasta reconstruir Windows.
+
+Tanda de prueba sin publicar: una Release `vX.Y.Z-factory-test` construida aquí y
+`publish.yml` en seco con `"tag"` en la tanda y `entrada_previa=<slug>=<commit del central>`
+(para partir de una entrada del manifest anterior a esa versión).
 
 ## Dónde corre cada test
 

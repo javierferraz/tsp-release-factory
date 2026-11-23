@@ -4,6 +4,8 @@ Las funciones puras se prueban sin red. La prueba de integracion levanta el FTPS
 sign-manifest simulados y corre el ftp_release.py --fabrica del repo central sobre una
 COPIA de sus scripts (su credentials.json lo busca junto a los scripts, asi que nunca ve
 el de verdad). Necesita el central (TSP_CENTRAL o la carpeta hermana) y el puerto 21 libre.
+La ficha de release (S-1275) se prueba contra release_ficha.py de ese mismo central: sin ficha
+publicable ftp_release.py --fabrica no sube, y la comprobacion remota descarga cada binario.
 """
 import hashlib
 import json
@@ -38,7 +40,12 @@ def app(**kw):
 
 def test_parse_apps_normaliza_plataformas():
     out = publish.parse_apps(json.dumps([app()]))
-    assert out == [dict(app(), platforms=['windows', 'linux'])]
+    assert out == [dict(app(), platforms=['windows', 'linux'], tag='v1.0.0')]
+
+
+def test_parse_apps_tag_de_pruebas():
+    out = publish.parse_apps(json.dumps([app(tag='v1.0.0-factory-test')]))
+    assert out[0]['tag'] == 'v1.0.0-factory-test'
 
 
 @pytest.mark.parametrize('bad', [
@@ -48,6 +55,8 @@ def test_parse_apps_normaliza_plataformas():
     app(platforms=['macos']),
     app(platforms=[]),
     dict(app(), extra=1),
+    app(tag='v1.0.1'),
+    app(tag='1.0.0'),
 ])
 def test_parse_apps_rechaza(bad):
     with pytest.raises(Fallo):
@@ -280,6 +289,88 @@ def test_dry_wrapper_solo_firma_en_local():
     assert '"127.0.0.1", "localhost"' in code and 'SIGN_ENDPOINT = endpoint' in code
 
 
+# ── ficha de release (S-1275) ──
+
+COMMIT = 'c' * 40
+PRUEBAS_OK = {'funcionales': 'ok: tests', 'instalacion_limpia': 'ok: smoke', 'arranque': 'ok: smoke',
+              'actualizacion': 'ok: v0.9.0 -> v1.0.0', 'desinstalacion': 'ok: smoke'}
+AUT = {'quien': 'javierferraz', 'cuando': '2026-11-23T10:00:00Z', 'texto': 'tanda del 23', 'ejecucion': 'https://run'}
+
+
+def _pruebas_win(**kw):
+    d = {'app': 'demo', 'version': '1.0.0', 'commit': COMMIT, 'plataforma': 'windows-x64',
+         'ejecucion': 'https://build', 'herramientas': {'python': '3.12'}, 'pruebas': dict(PRUEBAS_OK)}
+    d.update(kw)
+    return d
+
+
+def _ficha(slug='demo', plats=('windows',), pruebas=None, visual=publish.SIN_INFORME_VISUAL, aut=AUT):
+    pw = _pruebas_win(pruebas=pruebas or dict(PRUEBAS_OK))
+    return publish.ficha_datos(slug, 'javierferraz/demo', '1.0.0', 'v1.0.0', COMMIT, list(plats), pw, visual,
+                               'Authenticode del instalador', 'Faster start.', aut)
+
+
+def _release_ficha():
+    c = _central()
+    if c is None:
+        pytest.skip('sin el repo central (TSP_CENTRAL)')
+    mod = publish.load_central_module(c, 'release_ficha')
+    if not hasattr(mod, 'publicable'):
+        pytest.skip('el central aun no tiene release_ficha.publicable (S-1275)')
+    return mod, mod.cargar_politica(str(c / 'docs' / 'distribucion' / 'ficha-obligatoria.json'))
+
+
+def test_pruebas_validas():
+    assert publish.pruebas_validas(_pruebas_win(), 'demo', '1.0.0', COMMIT) == []
+    assert publish.pruebas_validas(_pruebas_win(commit='d' * 40), 'demo', '1.0.0', COMMIT)
+    assert publish.pruebas_validas(_pruebas_win(version='0.9.0'), 'demo', '1.0.0', COMMIT)
+    sin = _pruebas_win(pruebas={k: v for k, v in PRUEBAS_OK.items() if k != 'actualizacion'})
+    assert any('actualizacion' in m for m in publish.pruebas_validas(sin, 'demo', '1.0.0', COMMIT))
+    assert publish.pruebas_validas([], 'demo', '1.0.0', COMMIT)
+
+
+def test_informe_visual():
+    assert publish.informe_visual(None, 'x.json') == publish.SIN_INFORME_VISUAL
+    v = publish.informe_visual({'estado': 'verde', 'commit': COMMIT, 'medidas': 7, 'otro': 1}, 'x.json')
+    assert v == {'estado': 'verde', 'commit': COMMIT, 'medidas': 7, 'fuente': 'x.json'}
+    assert publish.informe_visual({'estado': 'verde', 'medidas': '7'}, 'x.json')['medidas'] == 0
+
+
+def test_parse_autorizacion():
+    assert publish.parse_autorizacion('') == {}
+    assert publish.parse_autorizacion(json.dumps(AUT)) == AUT
+    for bad in ('{', '[]', json.dumps({'quien': 1}), json.dumps({**AUT, 'otra': 'x'})):
+        with pytest.raises(Fallo):
+            publish.parse_autorizacion(bad)
+
+
+def test_ficha_completa_es_publicable():
+    rf, pol = _release_ficha()
+    d = _ficha(plats=('windows', 'linux'))
+    assert rf.publicable(d, 'demo', 'windows-x64', pol) == []
+    assert rf.publicable(d, 'demo', 'linux-x64', pol) == []     # Linux: aun sin pruebas exigidas
+    assert d['pruebas_por_plataforma']['linux-x64']['instalacion_limpia'] == publish.SIN_PRUEBAS_LINUX
+    assert 'pruebas' not in d
+
+
+def test_ficha_sin_informe_de_pruebas_o_sin_autorizacion_no_es_publicable():
+    rf, pol = _release_ficha()
+    d = publish.ficha_datos('demo', 'javierferraz/demo', '1.0.0', 'v1.0.0', COMMIT, ['windows'], None,
+                            publish.SIN_INFORME_VISUAL, 'x', 'notas', AUT)
+    assert any('instalacion_limpia' in m for m in rf.publicable(d, 'demo', 'windows-x64', pol))
+    assert any('autorizacion.quien' in m for m in rf.publicable(_ficha(aut={}), 'demo', 'windows-x64', pol))
+
+
+def test_ficha_informe_visual_exigido():
+    rf, pol = _release_ficha()
+    app_exigida = next(iter(pol['informe_visual_exigido']))
+    assert rf.publicable(_ficha(app_exigida), app_exigida, 'windows-x64', pol)
+    verde = publish.informe_visual({'estado': 'verde', 'commit': COMMIT, 'medidas': 9}, 'v.json')
+    assert rf.publicable(_ficha(app_exigida, visual=verde), app_exigida, 'windows-x64', pol) == []
+    otro = publish.informe_visual({'estado': 'verde', 'commit': 'e' * 40, 'medidas': 9}, 'v.json')
+    assert rf.publicable(_ficha(app_exigida, visual=otro), app_exigida, 'windows-x64', pol)
+
+
 # ── integracion: ftp_release.py --fabrica contra el FTP simulado ──
 
 def _central():
@@ -309,6 +400,9 @@ def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path, monkeyp
     central = tmp_path / 'central'
     shutil.copytree(_central() / 'scripts', central / 'scripts',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    (central / 'docs' / 'distribucion').mkdir(parents=True)
+    shutil.copyfile(_central() / 'docs' / 'distribucion' / 'ficha-obligatoria.json',
+                    central / 'docs' / 'distribucion' / 'ficha-obligatoria.json')
     (central / 'updates').mkdir()
     url = 'https://thestromboliproject.com/releases/demo/v1.0.0/demo-v1.0.0-windows-x64-setup.exe'
     manifest = {'version': 1, 'sig': 'vieja', 'tools': [
@@ -329,7 +423,18 @@ def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path, monkeyp
         mock.seed('/releases/demo/v0.9.0/demo-v0.9.0-windows-x64-setup.exe', b'version vieja')
         mock.seed('/updates/manifest.json', b'{}')
 
-        publish.run_ftp_release(central, 'demo', '1.0.0', [str(setup)], mock.sign_endpoint, tmp_path / 'ftp.log')
+        # Sin ficha publicable (S-1275): no se sube nada.
+        mala = tmp_path / 'ficha-mala.json'
+        publish.write_json(mala, _ficha('demo', pruebas={**PRUEBAS_OK, 'actualizacion': 'no_ejecutada: x'}))
+        with pytest.raises(Fallo):
+            publish.run_ftp_release(central, 'demo', '1.0.0', [str(setup)], mock.sign_endpoint,
+                                    tmp_path / 'ftp.log', mala)
+        assert not (mock.root / 'releases/demo/v1.0.0' / setup.name).exists()
+
+        buena = tmp_path / 'ficha.json'
+        publish.write_json(buena, _ficha('demo'))
+        publish.run_ftp_release(central, 'demo', '1.0.0', [str(setup)], mock.sign_endpoint,
+                                tmp_path / 'ftp.log', buena)
 
         root = mock.root
         sums = publish.parse_sums((root / 'releases/demo/v1.0.0' / sums_name).read_text(encoding='utf-8'))
@@ -341,6 +446,19 @@ def test_ftp_release_fabrica_sin_poda_y_suma_las_sumas_previas(tmp_path, monkeyp
         assert json.loads((root / 'updates/manifest.json').read_text(encoding='utf-8')) == signed
         reqs = mock.sign_requests()
         assert len(reqs) == 1 and reqs[0]['secret_ok'] and not reqs[0]['has_sig']
+
+        ficha = json.loads((central / 'releases-archive/demo/v1.0.0/ficha.json').read_text(encoding='utf-8'))
+        win = ficha['plataformas']['windows-x64']
+        assert win['faltan'] == [] and win['origen']['commit'] == COMMIT
+        assert win['autorizacion']['quien'] == 'javierferraz'
+
+        # Comprobacion remota por hash: pasa con el fichero subido y para si cambia un byte.
+        files = {setup.name: {'size': setup.stat().st_size, 'sha256': digest}}
+        mbytes = (central / 'updates' / 'manifest.json').read_bytes()
+        publish.verify_remote(central, 'demo', '1.0.0', files, mbytes, {})
+        (root / 'releases/demo/v1.0.0' / setup.name).write_bytes(b'instalador de pruebX')
+        with pytest.raises(Fallo, match='SHA256 descargado'):
+            publish.verify_remote(central, 'demo', '1.0.0', files, mbytes, {})
     finally:
         mock.stop()
     assert not (central / 'credentials.json').exists()

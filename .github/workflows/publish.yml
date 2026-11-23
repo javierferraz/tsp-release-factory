@@ -42,6 +42,16 @@ on:
         required: false
         type: string
         default: ''
+      autorizacion:
+        description: 'El «sí» para la ficha: {"quien","cuando","texto","ejecucion"} (lo pasa tanda.yml; vacío = quien lanza este run)'
+        required: false
+        type: string
+        default: ''
+      entrada_previa:
+        description: 'Solo en seco: slug=REV, parte de la entrada del manifest de ese commit del central (tanda de prueba de una versión ya publicada)'
+        required: false
+        type: string
+        default: ''
 
 # El GITHUB_TOKEN no se usa: el central y los repos de las apps van con APPS_TOKEN.
 permissions:
@@ -66,6 +76,8 @@ jobs:
       APPS: ${{ inputs.apps }}
       DRY_RUN: ${{ inputs.dry_run }}
       NOTAS_SECO: ${{ inputs.notas_seco }}
+      AUTORIZACION: ${{ inputs.autorizacion }}
+      ENTRADA_PREVIA: ${{ inputs.entrada_previa }}
       CENTRAL_REPO: javierferraz/2606-thestromboliproject
     steps:
       - name: Inicio
@@ -149,6 +161,18 @@ jobs:
           trap 'rm -f central/credentials.json' EXIT
           args=(--central central --work "$WORK" --apps "$APPS" --inicio-job "$JOB_START"
                 --resumen "$WORK/resumen.md" --resultado "$WORK/resultado.json")
+          # El «sí» para la ficha de release (S-1275). Lanzado a mano, el sí es el propio disparo:
+          # solo la cuenta de Javier puede lanzar workflows en esta fábrica.
+          if [ -z "$AUTORIZACION" ]; then
+            AUTORIZACION=$(jq -nc --arg q "$GITHUB_ACTOR" --arg c "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg e "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              '{quien: $q, cuando: $c, texto: "publish.yml lanzado a mano (Run workflow)", ejecucion: $e}')
+          fi
+          args+=(--autorizacion "$AUTORIZACION")
+          if [ -n "$ENTRADA_PREVIA" ]; then
+            [ "$DRY_RUN" = true ] || { echo "::error::entrada_previa es solo para el modo en seco"; exit 1; }
+            args+=(--entrada-previa "$ENTRADA_PREVIA")
+          fi
           if [ "$DRY_RUN" = false ]; then
             for v in FTP_HOST FTP_USER FTP_PASS SIGNING_SECRET; do
               [ -n "${!v}" ] || { echo "::error::falta el secreto de $v: no se publica"; exit 1; }
@@ -202,6 +226,7 @@ jobs:
           path: |
             ${{ runner.temp }}/publish/resumen.md
             ${{ runner.temp }}/publish/resultado.json
+            ${{ runner.temp }}/publish/fichas/*.json
             ${{ runner.temp }}/publish/publish.diff
             ${{ runner.temp }}/publish/*.log
             ${{ runner.temp }}/publish/mock/mock.log

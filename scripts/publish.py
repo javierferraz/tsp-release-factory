@@ -22,6 +22,7 @@ push, sin deploy real y sin tocar la Release. Publicar de verdad exige --publica
 Uso:
   python publish.py --central DIR --work DIR --apps '<json>' [--publicar]
                     [--resumen FICHERO.md] [--resultado FICHERO.json] [--inicio-job EPOCH]
+                    [--autorizacion JSON]
                     [--notas slug=FICHERO]... [--entrada-previa slug=REV]...   (solo en seco)
 
 --apps: [{"app": "bright-cardinal", "repo": "javierferraz/2610-bright-cardinal",
@@ -31,6 +32,18 @@ Contrato con R7 (quien prepara la tanda): la Release lleva un fichero release-no
 {"windows": "...", "linux": "..."}: una o dos frases en ingles para quien usa la app, sin
 numeros de tarjeta ni nombres de ficheros. "windows" va al manifest, a <app>-latest.json y a
 news/; "linux", a la entrada linux-x64 del manifest.
+
+Ficha de release (S-1275, PAA2 P6-1): por cada app se arma la ficha (release_ficha.py del
+central) con el commit del tag, la construccion, las pruebas por plataforma (de
+<app>-v<ver>-windows-pruebas.json, que deja el build de Windows en la Release), el informe
+visual (<app>-v<ver>-informe-visual.json si lo hay; lo producira P6-2), las notas y el «si»
+(--autorizacion). Si no es publicable segun docs/distribucion/ficha-obligatoria.json, la app
+se excluye (en seco: «en real esto pararia»). Se pasa a ftp_release.py --fabrica --ficha, el
+hash de cada binario se comprueba descargandolo de nuevo por FTP y la ficha final se sube a
+la Release como <app>-v<ver>-ficha.json (en seco solo queda en el artefacto).
+
+--apps admite "tag" (solo en seco) para probar con una Release de pruebas vX.Y.Z-sufijo.
+--autorizacion: {"quien", "cuando", "texto", "ejecucion"} — el «si» que lanzo la publicacion.
 """
 import argparse
 import datetime
@@ -64,6 +77,12 @@ LABELS_TAURI = {'deb': 'Ubuntu 24.04+ / Debian 13+', 'AppImage': 'Other distros 
 LABELS_PYSIDE = {'deb': 'Ubuntu / Debian', 'AppImage': 'Other distros'}
 MOCK_FTP_PORT = 21
 SPANISH_HINTS = (' el ', ' la ', ' los ', ' las ', ' que ', ' para ', ' con ', ' una ', ' del ', ' ahora ')
+# Ficha de release (S-1275)
+PRUEBAS_FICHA = ('funcionales', 'instalacion_limpia', 'actualizacion', 'desinstalacion')
+SIN_INFORME_VISUAL = 'sin_medida: la fabrica aun no produce el informe visual (P6-2)'
+SIN_PRUEBAS_WINDOWS = 'no_ejecutada: la Release no trae un informe de pruebas valido de la fabrica'
+SIN_PRUEBAS_LINUX = 'no_ejecutada: la fabrica aun no deja informe de pruebas de Linux'
+VERIFICACION_FTP = 'tamaño y SHA256 (publish.py lo descarga de nuevo en una sesion FTP nueva)'
 
 
 class Fallo(Exception):
@@ -143,7 +162,8 @@ def parse_apps(text):
         raise Fallo('--apps tiene que ser una lista no vacia')
     seen, out = set(), []
     for item in data:
-        if not isinstance(item, dict) or set(item) != {'app', 'repo', 'version', 'platforms'}:
+        if (not isinstance(item, dict) or not {'app', 'repo', 'version', 'platforms'} <= set(item)
+                or not set(item) <= {'app', 'repo', 'version', 'platforms', 'tag'}):
             raise Fallo(f'entrada de --apps con claves inesperadas: {item!r}')
         app, repo, ver, plats = item['app'], item['repo'], item['version'], item['platforms']
         if not isinstance(app, str) or not SLUG_RE.match(app):
@@ -155,11 +175,29 @@ def parse_apps(text):
         if (not isinstance(plats, list) or not plats or len(set(plats)) != len(plats)
                 or not set(plats) <= {'windows', 'linux'}):
             raise Fallo(f'platforms no valido para {app}: {plats!r}')
+        tag = item.get('tag', f'v{ver}')
+        if not isinstance(tag, str) or not re.fullmatch(rf'v{re.escape(ver)}(-[0-9A-Za-z.-]+)?', tag):
+            raise Fallo(f'tag no valido para {app}: {tag!r} (v{ver} o v{ver}-sufijo)')
         if app in seen:
             raise Fallo(f'{app} aparece dos veces')
         seen.add(app)
-        out.append({'app': app, 'repo': repo, 'version': ver, 'platforms': sorted(plats, reverse=True)})
+        out.append({'app': app, 'repo': repo, 'version': ver, 'platforms': sorted(plats, reverse=True),
+                    'tag': tag})
     return out
+
+
+def parse_autorizacion(text):
+    """El «si» que lanzo la publicacion, para la ficha. Vacio = {} (la ficha dira que falta)."""
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise Fallo(f'--autorizacion no es JSON valido: {e}')
+    if (not isinstance(data, dict) or not set(data) <= {'quien', 'cuando', 'texto', 'ejecucion'}
+            or not all(isinstance(v, str) for v in data.values())):
+        raise Fallo(f'--autorizacion: se esperan textos quien, cuando, texto y ejecucion: {data!r}')
+    return data
 
 
 def parse_pairs(values, what):
@@ -557,9 +595,61 @@ def tauri_conf(repo, tag, version):
     return conf
 
 
-def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch=None):
+def tag_commit(repo, tag):
+    sha = gh('api', f'repos/{repo}/commits/{tag}', '--jq', '.sha').stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise Fallo(f'no se puede leer el commit del tag {tag} de {repo}: {sha[:80]!r}')
+    return sha
+
+
+def pruebas_validas(data, slug, ver, commit):
+    """Por que el informe de pruebas de Windows de la Release no vale; [] si vale."""
+    if not isinstance(data, dict) or not isinstance(data.get('pruebas'), dict):
+        return ['no es un informe de pruebas']
+    out = [f'{k} es {data.get(k)!r}, no {v!r}' for k, v in
+           (('app', slug), ('version', ver), ('commit', commit), ('plataforma', 'windows-x64'))
+           if data.get(k) != v]
+    out += [f'sin la prueba «{k}»' for k in PRUEBAS_FICHA if not data['pruebas'].get(k)]
+    return out
+
+
+def informe_visual(data, fuente):
+    """El informe visual de la Release, en la forma que lee release_ficha.publicable()."""
+    if data is None:
+        return SIN_INFORME_VISUAL
+    medidas = data.get('medidas')
+    return {'estado': str(data.get('estado') or ''), 'commit': str(data.get('commit') or ''),
+            'medidas': medidas if isinstance(medidas, int) else 0, 'fuente': fuente}
+
+
+def ficha_datos(slug, repo, ver, tag, commit, plats, pruebas_win, visual, firma, notas, autorizacion):
+    """Lo que ftp_release.py --ficha pone en la ficha de release de esta subida (release_ficha.py).
+
+    pruebas_win: el informe del build de Windows ya validado, o None. Lo que la fabrica no
+    comprueba se declara con su motivo («no_ejecutada: …»), nunca se da por bueno."""
+    por_plat = {}
+    if 'windows' in plats:
+        p = dict(pruebas_win['pruebas']) if pruebas_win else {k: SIN_PRUEBAS_WINDOWS for k in PRUEBAS_FICHA}
+        por_plat['windows-x64'] = {**p, 'informe_visual': visual}
+    if 'linux' in plats:
+        por_plat['linux-x64'] = {**{k: SIN_PRUEBAS_LINUX for k in PRUEBAS_FICHA}, 'informe_visual': visual}
+    herramientas = (pruebas_win or {}).get('herramientas') or {'runner': 'GitHub Actions (fabrica)'}
+    return {
+        'origen': {'repo': repo, 'commit': commit, 'tag': tag, 'ramas': [], 'tareas': []},
+        'construccion': {'donde': 'fabrica', 'ejecucion': (pruebas_win or {}).get('ejecucion', ''),
+                         'herramientas': herramientas, 'firma_verificada': firma},
+        'pruebas_por_plataforma': por_plat,
+        'contenido': {'changelog_contrastado': 'no_ejecutada: la fabrica solo comprueba que el CHANGELOG '
+                                               'esta sellado con esta version',
+                      'notas_en': notas or '',
+                      'ficha_web_comprobada': 'no_ejecutada: la fabrica no revisa la ficha de la web'},
+        'autorizacion': autorizacion or {},
+    }
+
+
+def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch=None, autorizacion=None):
     slug, repo, ver, plats = spec['app'], spec['repo'], spec['version'], spec['platforms']
-    tag = f'v{ver}'
+    tag = spec.get('tag') or f'v{ver}'
     rel = release_info(repo, tag)
     if rel.get('isDraft'):
         raise Fallo(f'la Release {tag} es un borrador')
@@ -584,7 +674,11 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
     missing = [n for n in want if n not in sizes]
     if missing:
         raise Fallo(f'a la Release {tag} le faltan: {", ".join(missing)}')
-    extras = [n for n in optional + ['SHA256SUMS.txt', 'linux-SHA256SUMS.txt', 'release-notes.json']
+    names['pruebas'] = f'{slug}-v{ver}-windows-pruebas.json'
+    names['visual'] = f'{slug}-v{ver}-informe-visual.json'
+    names['ficha'] = f'{slug}-v{ver}-ficha.json'
+    extras = [n for n in optional + ['SHA256SUMS.txt', 'linux-SHA256SUMS.txt', 'release-notes.json',
+                                     names['pruebas'], names['visual'], names['ficha']]
               if n in sizes]
     portable_name = next((n for n in optional if n in sizes), None)
 
@@ -628,7 +722,7 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
             rep.check(slug, f'{n}: SHA256 coincide con {src}')
         files[n] = {'name': n, 'size': sizes[n], 'sha256': digest, 'path': str(dest / n), 'ref': bool(ref)}
 
-    plan = {'app': slug, 'repo': repo, 'version': ver, 'platforms': plats, 'tauri': tauri,
+    plan = {'app': slug, 'repo': repo, 'version': ver, 'tag': tag, 'platforms': plats, 'tauri': tauri,
             'release': rel, 'files': {}, 'latest': {}, 'windows_format': 'nsis' if tauri else 'inno'}
 
     if 'windows' in plats:
@@ -707,6 +801,46 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
         if not f['ref']:
             rep.fallaria(slug, f'{n} sin SHA256 de referencia (ni SHA256SUMS en la Release ni manifest)')
 
+    # Ficha de release (S-1275): sin ficha publicable no se sube nada de esta app.
+    if plan['files']:
+        commit = tag_commit(repo, tag)
+        pruebas_win = None
+        if 'windows' in plats:
+            if (dest / names['pruebas']).exists():
+                pruebas_win = json.loads((dest / names['pruebas']).read_text(encoding='utf-8-sig'))
+                malas = pruebas_validas(pruebas_win, slug, ver, commit)
+                if malas:
+                    rep.fallaria(slug, f"{names['pruebas']} no vale: {'; '.join(malas)}")
+                    pruebas_win = None
+                else:
+                    rep.check(slug, f"informe de pruebas de Windows del commit {commit[:12]} "
+                                    f"({pruebas_win.get('ejecucion', '')})")
+            else:
+                rep.check(slug, f"la Release no trae {names['pruebas']}")
+        visual_data = None
+        if (dest / names['visual']).exists():
+            visual_data = json.loads((dest / names['visual']).read_text(encoding='utf-8-sig'))
+        firma = ('Authenticode del instalador' + (' y .sig de Tauri' if tauri else '')
+                 + ('; los paquetes de Linux no van firmados' if 'linux' in plats else '')
+                 if 'windows' in plats else 'no_aplica: los paquetes de Linux no van firmados')
+        datos = ficha_datos(slug, repo, ver, tag, commit, plats, pruebas_win,
+                            informe_visual(visual_data, names['visual']), firma,
+                            plan.get('windows_notes') or notes.get('linux'), autorizacion)
+        release_ficha = load_central_module(central, 'release_ficha')
+        politica = release_ficha.cargar_politica(str(central / 'docs' / 'distribucion' / 'ficha-obligatoria.json'))
+        subir = sorted({release_ficha.plataforma(n) for n in plan['files']})
+        motivos = [f'{p}: {m}' for p in subir for m in release_ficha.publicable(datos, slug, p, politica)]
+        for m in motivos:
+            rep.fallaria(slug, f'ficha no publicable ({m})')
+        if not motivos:
+            rep.check(slug, f"ficha publicable para {', '.join(subir)} (commit {commit[:12]}, "
+                            f"autorizacion de {datos['autorizacion'].get('quien')})")
+        plan['ficha_datos'] = work / 'fichas' / f'{slug}-datos.json'
+        plan['ficha_datos'].parent.mkdir(parents=True, exist_ok=True)
+        write_json(plan['ficha_datos'], datos)
+        plan['ficha_previa'] = dest / names['ficha'] if (dest / names['ficha']).exists() else None
+        plan['ficha_nombre'] = names['ficha']
+
     if entry is None:
         if 'windows_block' not in plan:
             raise Fallo('app nueva en el manifest sin Windows en la tanda')
@@ -744,8 +878,9 @@ def ftp_write(ftp, path, data):
 
 
 def verify_remote(central, slug, version, files, manifest_bytes, latest):
-    """Sesion FTP NUEVA: los binarios siguen ahi con su tamano (LIST + SIZE), el SHA256SUMS los
-    lista con su hash, y manifest.json y *-latest.json son byte a byte los locales."""
+    """Sesion FTP NUEVA: los binarios siguen ahi con su tamano (LIST + SIZE) y su SHA256 (se
+    descargan de nuevo, S-1275), el SHA256SUMS los lista con su hash, y manifest.json y
+    *-latest.json son byte a byte los locales."""
     ftp = ftp_connect(central)
     try:
         folder = f'/releases/{slug}/v{version}'
@@ -758,6 +893,10 @@ def verify_remote(central, slug, version, files, manifest_bytes, latest):
             size = ftp.size(f'{folder}/{name}')
             if size != f['size']:
                 raise Fallo(f'{folder}/{name}: {size} bytes en el FTP, {f["size"]} en local')
+            h = hashlib.sha256()
+            ftp.retrbinary(f'RETR {folder}/{name}', h.update)
+            if h.hexdigest() != f['sha256']:
+                raise Fallo(f'{folder}/{name}: el SHA256 descargado del FTP no es el del binario comprobado')
         if files:
             sums = parse_sums(ftp_read(ftp, f'{folder}/{slug}-v{version}-SHA256SUMS.txt').decode('utf-8'))
             for name, f in files.items():
@@ -789,9 +928,10 @@ ftp_release.main()
 '''
 
 
-def run_ftp_release(central, slug, version, paths, sign_endpoint, log):
-    """sign_endpoint: el del sign-manifest simulado (en seco) o None (el de verdad)."""
-    args = ['--fabrica', slug, version, *paths]
+def run_ftp_release(central, slug, version, paths, sign_endpoint, log, ficha):
+    """sign_endpoint: el del sign-manifest simulado (en seco) o None (el de verdad).
+    ficha: los datos de la ficha de release; ftp_release.py --fabrica no sube sin ellos."""
+    args = ['--fabrica', '--ficha', str(ficha), slug, version, *paths]
     if sign_endpoint:
         cmd = [sys.executable, '-c', DRY_WRAPPER, str(central / 'scripts'), sign_endpoint, *args]
     else:
@@ -867,6 +1007,31 @@ class Mock:
 
 # ───────────────────────────── fase 2: publicar una app ─────────────────────────────
 
+def ficha_final(plan, ficha_path, work, seco, rep):
+    """Apunta en la ficha que escribio ftp_release.py la comprobacion por hash y la sube a la
+    Release (en seco solo queda en el artefacto, work/fichas/)."""
+    slug = plan['app']
+    if not ficha_path.exists():
+        raise Fallo(f'ftp_release.py no dejo la ficha de release en {ficha_path}')
+    ficha = json.loads(ficha_path.read_text(encoding='utf-8'))
+    for bloque in (ficha.get('plataformas') or {}).values():
+        if any(a.get('nombre') in plan['files'] for a in bloque.get('artefactos') or []):
+            bloque.setdefault('publicacion', {})['verificacion_remota'] = VERIFICACION_FTP
+    write_json(ficha_path, ficha)
+    out = work / 'fichas' / plan['ficha_nombre']
+    write_json(out, ficha)
+    cmd = ['release', 'upload', plan['tag'], '-R', plan['repo'], str(out), '--clobber']
+    if seco:
+        rep.check(slug, f"ficha de release en el artefacto ({out.name}); (en seco) se subiria a la Release "
+                        f"{plan['tag']}")
+    elif gh(*cmd, check=False).returncode == 0:
+        rep.check(slug, f"ficha de release subida a la Release {plan['tag']} ({out.name})")
+    else:
+        # Ya esta publicado: que no pare el resto (main, web, puerta). La ficha sigue en el artefacto.
+        rep.avisos.append(f"{slug}: no se pudo subir {out.name} a la Release {plan['tag']}: "
+                          'subela a mano desde el artefacto de este run')
+
+
 def publish_app(plan, central, work, seco, rep, mock, today, now_iso):
     slug, ver = plan['app'], plan['version']
     manifest_path = central / 'updates' / 'manifest.json'
@@ -883,12 +1048,18 @@ def publish_app(plan, central, work, seco, rep, mock, today, now_iso):
     changed_manifest = manifest != json.loads(snapshot)   # por contenido: el checkout puede venir en CRLF
 
     uploaded = False
+    ficha_path = central / 'releases-archive' / slug / f'v{ver}' / 'ficha.json'
     if plan['files']:
+        # La ficha de una subida anterior de esta version (p. ej. Windows antes que Linux):
+        # ftp_release.py le añade el bloque de esta plataforma y conserva los demas.
+        if plan.get('ficha_previa') and not ficha_path.exists():
+            ficha_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(plan['ficha_previa'], ficha_path)
         manifest_path.write_bytes(new_bytes)
         sign_before = len(mock.sign_requests()) if mock else 0
         try:
             run_ftp_release(central, slug, ver, [f['path'] for f in plan['files'].values()],
-                            mock.sign_endpoint if seco else None, log)
+                            mock.sign_endpoint if seco else None, log, plan['ficha_datos'])
         except Fallo as e:
             manifest_path.write_bytes(snapshot)
             raise Fallo(f'ftp_release.py: {e} (manifest local restaurado; ver {log.name})')
@@ -935,8 +1106,11 @@ def publish_app(plan, central, work, seco, rep, mock, today, now_iso):
     if uploaded or latest_bytes:
         n = verify_remote(central, slug, ver, plan['files'],
                           manifest_path.read_bytes() if uploaded else None, latest_bytes)
-        rep.check(slug, f'sesion FTP nueva: LIST ({n} entradas) y SIZE de cada fichero, SHA256SUMS, '
-                        'manifest y latest iguales a los locales')
+        rep.check(slug, f'sesion FTP nueva: LIST ({n} entradas), SIZE y SHA256 (descargado de nuevo) de '
+                        'cada fichero, SHA256SUMS, manifest y latest iguales a los locales')
+
+    if uploaded:
+        ficha_final(plan, ficha_path, work, seco, rep)
 
     # Web: fallback de las fichas a medida y novedades
     if 'windows' in plan['platforms']:
@@ -1104,6 +1278,7 @@ def main(argv=None):
     ap.add_argument('--inicio-job', type=float)
     ap.add_argument('--notas', action='append')
     ap.add_argument('--entrada-previa', action='append')
+    ap.add_argument('--autorizacion', help='JSON {"quien","cuando","texto","ejecucion"}: el «si» para la ficha')
     args = ap.parse_args(argv)
     t0 = time.time()
     seco = not args.publicar
@@ -1118,6 +1293,9 @@ def main(argv=None):
         previous = parse_pairs(args.entrada_previa, '--entrada-previa')
         if not seco and (notes_override or previous):
             raise Fallo('--notas y --entrada-previa son solo para el modo en seco')
+        if not seco and any(s['tag'] != f"v{s['version']}" for s in apps):
+            raise Fallo('un tag con sufijo (Release de pruebas) solo se usa en seco')
+        autorizacion = parse_autorizacion(args.autorizacion)
         host = credentials_host(central)
         if seco and host not in (None, '127.0.0.1'):
             raise Fallo('en seco no se usa un checkout con credentials.json real: usa un clon aparte')
@@ -1131,6 +1309,8 @@ def main(argv=None):
         manifest_path = central / 'updates' / 'manifest.json'
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         for slug, rev in previous.items():
+            if git(central, 'cat-file', '-e', f'{rev}^{{commit}}', check=False).returncode != 0:
+                git_auth(central, 'fetch', '-q', '--depth=1', 'origin', rev)   # el checkout es de profundidad 1
             old = json.loads(git(central, 'show', f'{rev}:updates/manifest.json').stdout)
             old_entry = next(t for t in old['tools'] if t['tool'] == slug)
             manifest['tools'] = [old_entry if t['tool'] == slug else t for t in manifest['tools']]
@@ -1142,7 +1322,8 @@ def main(argv=None):
 
         for spec in apps:
             try:
-                plans[spec['app']] = prepare(spec, manifest, central, work, rep, notes_override)
+                plans[spec['app']] = prepare(spec, manifest, central, work, rep, notes_override,
+                                             autorizacion=autorizacion)
                 rep.app(spec['app'], estado='lista')
             except Fallo as e:
                 rep.app(spec['app'], estado='excluida', motivo=str(e))
@@ -1248,7 +1429,7 @@ def main(argv=None):
             rel = plan['release']
             if not rel.get('isPrerelease'):
                 continue
-            cmd = ['release', 'edit', f"v{plan['version']}", '-R', plan['repo'], '--prerelease=false', '--latest']
+            cmd = ['release', 'edit', plan['tag'], '-R', plan['repo'], '--prerelease=false', '--latest']
             if seco:
                 rep.check(plan['app'], f"(en seco) se haria: gh {' '.join(cmd)}")
             else:

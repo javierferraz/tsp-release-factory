@@ -5,6 +5,10 @@ name: Build Tauri (Windows)
 # manifest, ni web (eso es R6). Paquete R4 de docs/distribucion/releases-automaticas.md
 # (repo central, S-1069).
 #
+# Pruebas en el runner (S-1275, PAA2 P6-1): actualizacion desde la version anterior publicada
+# (instalar, abrir y cerrar, actualizar conservando ajustes, desinstalar) y despues el smoke
+# limpio. Lo que pasa queda en <app>-v<ver>-windows-pruebas.json, que lee la ficha de release.
+#
 # Solo se dispara a mano (o desde el «sí» de la tanda, R8): no hay entornos con aprobacion
 # en el plan gratuito, asi que la puerta humana es el propio disparo.
 #   gh workflow run build-tauri-windows.yml -R javierferraz/tsp-release-factory \
@@ -260,6 +264,34 @@ jobs:
           $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
           "| Instalador | ``$env:ASSET``, $mb MB, SHA256 ``$sha`` |" >> $env:REPORT
 
+      # S-1275 (PAA2 P6-1): antes del smoke limpio, la actualizacion desde la version anterior
+      # publicada: instalar la anterior, abrirla y cerrarla, actualizar, comprobar los ajustes y
+      # desinstalar. smoke-update.ps1 deja la maquina como estaba para el smoke limpio.
+      - name: Version anterior para probar la actualizacion
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          GH_TOKEN: ${{ secrets.APPS_TOKEN }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'anterior.json'
+          python "$env:GITHUB_WORKSPACE\factory\scripts\anterior.py" --app $env:APP --repo $env:APP_REPO --version $env:VERSION --dest (Join-Path $env:RUNNER_TEMP 'anterior') --out $out
+          if ($LASTEXITCODE -ne 0) { throw 'anterior.py falla (una descarga no cuadra con su hash)' }
+          "ANTERIOR_JSON=$out" >> $env:GITHUB_ENV
+          $a = Get-Content $out -Raw | ConvertFrom-Json
+          if ($a.no_aplica) { "| Version anterior | no hay: $($a.no_aplica) |" >> $env:REPORT }
+          else { "| Version anterior | v$($a.version), de $($a.origen); SHA256 comprobado |" >> $env:REPORT }
+
+      - name: Prueba de actualizacion en el runner
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          PRODUCT: ${{ steps.conf.outputs.product }}
+        run: |
+          $a = Get-Content $env:ANTERIOR_JSON -Raw | ConvertFrom-Json
+          if ($a.no_aplica) { 'Sin version anterior: no hay actualizacion que probar'; exit 0 }
+          $json = Join-Path $env:RUNNER_TEMP 'actualizacion.json'
+          & "$env:GITHUB_WORKSPACE\factory\scripts\smoke-update.ps1" -Kind nsis -ProductName $env:PRODUCT -Previous $a.ruta -PreviousVersion $a.version -Installer (Join-Path $env:OUT $env:ASSET) -Version $env:VERSION -Report $env:REPORT -Json $json
+          "UPDATE_JSON=$json" >> $env:GITHUB_ENV
+
       - name: Smoke del instalador en el runner
         env:
           VERSION: ${{ steps.meta.outputs.version }}
@@ -267,6 +299,26 @@ jobs:
           PRODUCT: ${{ steps.conf.outputs.product }}
         run: |
           & "$env:GITHUB_WORKSPACE\factory\scripts\smoke-nsis.ps1" -Installer (Join-Path $env:OUT $env:ASSET) -ProductName $env:PRODUCT -Version $env:VERSION -SignTool $env:SIGNTOOL -Report $env:REPORT
+
+      # S-1275: lo que publish.py pone en la ficha de release. Solo se llega aqui si todas las
+      # pruebas anteriores han pasado.
+      - name: Informe de pruebas para la ficha
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TESTS_EN: windows (npm test y cargo test)
+        run: |
+          $commit = (git -C app rev-parse HEAD).Trim()
+          $file = "$env:APP-v$env:VERSION-windows-pruebas.json"
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $pargs = @('--app', $env:APP, '--version', $env:VERSION, '--tag', $env:TAG, '--commit', $commit,
+                     '--ejecucion', $run, '--tests-en', $env:TESTS_EN, '--instalador', 'nsis',
+                     '--anterior', $env:ANTERIOR_JSON, '--out', (Join-Path $env:OUT $file),
+                     '--herramienta', "node=$((node --version).Trim())", '--herramienta', "rust=$(((rustc --version) -split ' ')[1])")
+          if ($env:UPDATE_JSON) { $pargs += @('--actualizacion', $env:UPDATE_JSON) }
+          python "$env:GITHUB_WORKSPACE\factory\scripts\pruebas_windows.py" @pargs
+          if ($LASTEXITCODE -ne 0) { throw 'pruebas_windows.py falla' }
+          "PRUEBAS=$file" >> $env:GITHUB_ENV
+          "| Informe de pruebas | ``$file`` (commit ``$($commit.Substring(0, 12))``) |" >> $env:REPORT
 
       - name: Subir a la Release del repo de la app
         env:
@@ -281,14 +333,14 @@ jobs:
             $created = 'creada como prerelease'
           } else { $created = 'ya existia' }
           $names = gh release view $env:TAG -R $env:APP_REPO --json assets --jq '.assets[].name'
-          $clash = @($names | Where-Object { $_ -in @($env:ASSET, "$env:ASSET.sig", 'SHA256SUMS.txt') })
+          $clash = @($names | Where-Object { $_ -in @($env:ASSET, "$env:ASSET.sig", 'SHA256SUMS.txt', $env:PRUEBAS) })
           if ($clash.Count) { throw "La Release ya tiene: $($clash -join ', '). No se pisan." }
           Push-Location $env:OUT
-          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET "$env:ASSET.sig" SHA256SUMS.txt
+          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET "$env:ASSET.sig" SHA256SUMS.txt $env:PRUEBAS
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw 'gh release upload falla' }
-          "| Release $env:TAG | $created; subidos ``$env:ASSET``, ``.sig`` y ``SHA256SUMS.txt`` |" >> $env:REPORT
+          "| Release $env:TAG | $created; subidos ``$env:ASSET``, ``.sig``, ``SHA256SUMS.txt`` y ``$env:PRUEBAS`` |" >> $env:REPORT
 
       - name: Resumen
         if: always()
