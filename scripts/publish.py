@@ -36,7 +36,8 @@ news/; "linux", a la entrada linux-x64 del manifest.
 Ficha de release (S-1275, PAA2 P6-1): por cada app se arma la ficha (release_ficha.py del
 central) con el commit del tag, la construccion, las pruebas por plataforma (de
 <app>-v<ver>-windows-pruebas.json, que deja el build de Windows en la Release), el informe
-visual (<app>-v<ver>-informe-visual.json si lo hay; lo producira P6-2), las notas y el «si»
+visual (<app>-v<ver>-informe-visual.json, que deja el render real del build de Windows, P6-2;
+solo vale para Windows), las notas y el «si»
 (--autorizacion). Si no es publicable segun docs/distribucion/ficha-obligatoria.json, la app
 se excluye (en seco: «en real esto pararia»). Se pasa a ftp_release.py --fabrica --ficha, el
 hash de cada binario se comprueba descargandolo de nuevo por FTP y la ficha final se sube a
@@ -79,7 +80,9 @@ MOCK_FTP_PORT = 21
 SPANISH_HINTS = (' el ', ' la ', ' los ', ' las ', ' que ', ' para ', ' con ', ' una ', ' del ', ' ahora ')
 # Ficha de release (S-1275)
 PRUEBAS_FICHA = ('funcionales', 'instalacion_limpia', 'actualizacion', 'desinstalacion')
-SIN_INFORME_VISUAL = 'sin_medida: la fabrica aun no produce el informe visual (P6-2)'
+SIN_INFORME_VISUAL = ('sin_medida: la Release no trae informe visual (la app no tiene inventario de '
+                      'pantallas o el render real no lo dejo)')
+SIN_INFORME_VISUAL_LINUX = 'sin_medida: el render real (nivel 2) solo corre en el runner de Windows'
 SIN_PRUEBAS_WINDOWS = 'no_ejecutada: la Release no trae un informe de pruebas valido de la fabrica'
 SIN_PRUEBAS_LINUX = 'no_ejecutada: la fabrica aun no deja informe de pruebas de Linux'
 VERIFICACION_FTP = 'tamaño y SHA256 (publish.py lo descarga de nuevo en una sesion FTP nueva)'
@@ -661,7 +664,8 @@ def ficha_datos(slug, repo, ver, tag, commit, plats, pruebas_win, visual, firma,
         p = dict(pruebas_win['pruebas']) if pruebas_win else {k: SIN_PRUEBAS_WINDOWS for k in PRUEBAS_FICHA}
         por_plat['windows-x64'] = {**p, 'informe_visual': visual}
     if 'linux' in plats:
-        por_plat['linux-x64'] = {**{k: SIN_PRUEBAS_LINUX for k in PRUEBAS_FICHA}, 'informe_visual': visual}
+        por_plat['linux-x64'] = {**{k: SIN_PRUEBAS_LINUX for k in PRUEBAS_FICHA},
+                                 'informe_visual': SIN_INFORME_VISUAL_LINUX}
     herramientas = (pruebas_win or {}).get('herramientas') or {'runner': 'GitHub Actions (fabrica)'}
     return {
         'origen': {'repo': repo, 'commit': commit, 'tag': tag, 'ramas': [], 'tareas': []},

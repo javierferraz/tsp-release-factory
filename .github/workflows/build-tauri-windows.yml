@@ -300,6 +300,69 @@ jobs:
         run: |
           & "$env:GITHUB_WORKSPACE\factory\scripts\smoke-nsis.ps1" -Installer (Join-Path $env:OUT $env:ASSET) -ProductName $env:PRODUCT -Version $env:VERSION -SignTool $env:SIGNTOOL -Report $env:REPORT
 
+      # S-1276 (PAA2 P6-2): render real antes de la release (nivel 2 del laboratorio,
+      # docs/organizacion/03-calidad.md §3 del central). Solo para las apps con inventario de
+      # pantallas en el central (scripts/ui_fit/<app>.mjs). Dos pasadas con check_ui_fit_tauri.mjs:
+      # las pantallas del inventario en las 4 combinaciones de riesgo, en Edge con ventana real
+      # (el metodo calibrado en P1-4), y la app instalada de verdad con su WebView2, medida desde
+      # dentro y capturada con su ventana. Deja <app>-v<ver>-informe-visual.json y las capturas.
+      # No para el build: un informe en rojo o sin medir lo para publish.py donde la ficha lo exige.
+      - name: Checkout del central (solo la medida visual)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: javierferraz/2606-thestromboliproject
+          token: ${{ secrets.APPS_TOKEN }}
+          path: central
+          sparse-checkout: |
+            scripts/check_ui_fit_tauri.mjs
+            scripts/ui_fit
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Render real (nivel 2) e informe visual
+        continue-on-error: true
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          PRODUCT: ${{ steps.conf.outputs.product }}
+        run: |
+          $central = Join-Path $env:GITHUB_WORKSPACE 'central\scripts'
+          if (-not (Test-Path (Join-Path $central "ui_fit\$env:APP.mjs"))) {
+            '| Informe visual (nivel 2) | la app no tiene inventario de pantallas en el central: sin medida |' >> $env:REPORT
+            exit 0
+          }
+          $t0 = Get-Date
+          $dir = Join-Path $env:RUNNER_TEMP 'visual'
+          $medida = Join-Path $dir 'medida'
+          $inst = Join-Path $dir 'instalada'
+          $mjs = Join-Path $central 'check_ui_fit_tauri.mjs'
+          # El runner arranca a 1024x768: la ventana por defecto de las apps no cabe.
+          pwsh -NoProfile -File (Join-Path $central 'ui_fit\captura_ventana.ps1') -Resolucion 1920x1080
+
+          # 1. Pantallas del inventario, combinaciones de riesgo, interfaz construida en el tag (app\dist).
+          node $mjs --app app --inventario $env:APP --navegador edge --dist dist --riesgo --ventana --paralelo 2 --salida $medida
+          "medida: salida $LASTEXITCODE"
+
+          # 2. La app instalada de verdad (el smoke ya la desinstalo: se instala otra vez y se quita al final).
+          $p = Start-Process -FilePath (Join-Path $env:OUT $env:ASSET) -ArgumentList '/S' -Wait -PassThru
+          $entry = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq $env:PRODUCT }
+          if ($p.ExitCode -eq 0 -and $entry) {
+            $unins = ($entry.UninstallString -replace '"', '').Trim()
+            $exe = (Get-ChildItem (Split-Path -Parent $unins) -Filter '*.exe' | Where-Object { $_.Name -ne 'uninstall.exe' } | Select-Object -First 1).FullName
+            node $mjs --app app --inventario $env:APP --instalada $exe --salida $inst
+            "instalada: salida $LASTEXITCODE"
+            Start-Process -FilePath $unins -ArgumentList '/S' -Wait | Out-Null
+          } else { "no se pudo instalar para el render real (codigo $($p.ExitCode))" }
+
+          $commit = (git -C app rev-parse HEAD).Trim()
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          python "$env:GITHUB_WORKSPACE\factory\scripts\informe_visual.py" --app $env:APP --version $env:VERSION --tag $env:TAG --commit $commit --ejecucion $run --medida $medida --instalada $inst --out-dir $env:OUT --report $env:REPORT
+          if ($LASTEXITCODE -ne 0) { throw 'informe_visual.py falla' }
+          "VISUAL=$env:APP-v$env:VERSION-informe-visual.json" >> $env:GITHUB_ENV
+          "CAPTURAS=$env:APP-v$env:VERSION-capturas.zip" >> $env:GITHUB_ENV
+          "| Render real · duracion | $([math]::Round(((Get-Date) - $t0).TotalSeconds)) s |" >> $env:REPORT
+          exit 0
+
       # S-1275: lo que publish.py pone en la ficha de release. Solo se llega aqui si todas las
       # pruebas anteriores han pasado.
       - name: Informe de pruebas para la ficha
@@ -333,14 +396,17 @@ jobs:
             $created = 'creada como prerelease'
           } else { $created = 'ya existia' }
           $names = gh release view $env:TAG -R $env:APP_REPO --json assets --jq '.assets[].name'
-          $clash = @($names | Where-Object { $_ -in @($env:ASSET, "$env:ASSET.sig", 'SHA256SUMS.txt', $env:PRUEBAS) })
+          # S-1276: el informe visual y las capturas, si el render real los ha dejado.
+          $visual = @(@($env:VISUAL, $env:CAPTURAS) | Where-Object { $_ -and (Test-Path (Join-Path $env:OUT $_)) })
+          $clash = @($names | Where-Object { $_ -in (@($env:ASSET, "$env:ASSET.sig", 'SHA256SUMS.txt', $env:PRUEBAS) + $visual) })
           if ($clash.Count) { throw "La Release ya tiene: $($clash -join ', '). No se pisan." }
           Push-Location $env:OUT
-          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET "$env:ASSET.sig" SHA256SUMS.txt $env:PRUEBAS
+          gh release upload $env:TAG -R $env:APP_REPO $env:ASSET "$env:ASSET.sig" SHA256SUMS.txt $env:PRUEBAS @visual
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw 'gh release upload falla' }
-          "| Release $env:TAG | $created; subidos ``$env:ASSET``, ``.sig``, ``SHA256SUMS.txt`` y ``$env:PRUEBAS`` |" >> $env:REPORT
+          $extra = if ($visual.Count) { ', ' + (($visual | ForEach-Object { "``$_``" }) -join ', ') } else { '' }
+          "| Release $env:TAG | $created; subidos ``$env:ASSET``, ``.sig``, ``SHA256SUMS.txt``, ``$env:PRUEBAS``$extra |" >> $env:REPORT
 
       - name: Resumen
         if: always()

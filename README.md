@@ -238,10 +238,17 @@ El circuito manual (sin `--fabrica`) no cambia.
   (en seco queda en el artefacto `publish-<run>`, carpeta `fichas/`).
 - **El «sí»**: `tanda.yml` pasa quién lanzó la tanda, cuándo y el run (`autorizacion`). Lanzado a
   mano, `publish.yml` apunta a quien lo lanzó.
+- **Informe visual (S-1276, PAA2 P6-2)**: el build de Windows Tauri, tras el smoke, hace el render
+  real (nivel 2 del laboratorio) si la app tiene inventario de pantallas en el central
+  (`scripts/ui_fit/<app>.mjs`; hoy solo Clear Parrot). Dos pasadas de `check_ui_fit_tauri.mjs`:
+  «medida» (las pantallas del inventario en las 4 combinaciones de riesgo, Edge con ventana real,
+  sobre el `dist` del tag) e «instalada» (la app instalada, con su WebView2, medida desde dentro
+  por la conexión de depuración y capturada con su ventana). `scripts/informe_visual.py` deja en la
+  Release `<app>-v<ver>-informe-visual.json` (`estado` verde/rojo/no_medido, `commit`, `medidas`,
+  cortes por pasada) y `<app>-v<ver>-capturas.zip`. El paso no para el build: lo para `publish.py`
+  donde `ficha-obligatoria.json` lo exige. Cuesta unos 2-3 min de Windows por release.
 - **Lo que aún no hay**: pruebas de instalación en Linux (quedan «no_ejecutada» con motivo; Linux
-  no tiene pruebas exigidas) e informe visual (lo producirá P6-2 como
-  `<app>-v<ver>-informe-visual.json` con `estado`, `commit` y `medidas`). Clear Parrot lo tiene
-  exigido en Windows, así que hasta P6-2 solo se publica por el circuito manual.
+  no tiene pruebas exigidas), informe visual en Linux y en las apps PySide6.
 - **Releases construidas antes de esto** no traen el informe de pruebas: no se publican desde la
   fábrica hasta reconstruir Windows.
 
