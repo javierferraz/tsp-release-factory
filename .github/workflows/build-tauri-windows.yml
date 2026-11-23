@@ -308,6 +308,7 @@ jobs:
       # dentro y capturada con su ventana. Deja <app>-v<ver>-informe-visual.json y las capturas.
       # No para el build: un informe en rojo o sin medir lo para publish.py donde la ficha lo exige.
       - name: Checkout del central (solo la medida visual)
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: javierferraz/2606-thestromboliproject
