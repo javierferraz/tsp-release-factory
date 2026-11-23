@@ -336,6 +336,16 @@ def test_informe_visual():
     assert publish.informe_visual({'estado': 'verde', 'medidas': '7'}, 'x.json')['medidas'] == 0
 
 
+def test_json_roto_de_la_release_no_tumba_la_tanda(tmp_path):
+    # Revision S-1275: un JSON roto deja fuera esa app con su motivo, no lanza una excepcion.
+    roto = tmp_path / 'roto.json'
+    roto.write_text('{"estado": ', encoding='utf-8')
+    data = publish.leer_json(roto)
+    assert publish.pruebas_validas(data, 'demo', '1.0.0', COMMIT) == ['no es un informe de pruebas']
+    assert publish.informe_visual(data, 'v.json')['estado'] == 'ilegible'
+    assert publish.informe_visual([1], 'v.json')['estado'] == 'ilegible'
+
+
 def test_parse_autorizacion():
     assert publish.parse_autorizacion('') == {}
     assert publish.parse_autorizacion(json.dumps(AUT)) == AUT

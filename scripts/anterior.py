@@ -12,9 +12,9 @@ Por orden:
      vX.Y.Z más alto por debajo de --version que tenga instalador de Windows, comprobado contra
      el SHA256SUMS de esa Release o el digest que da GitHub del fichero.
 
-Escribe en --out {"version", "ruta", "origen", "sha256"} o, si no hay ninguna,
-{"no_aplica": "motivo"} (primera versión de la app). Sale con 1 si una descarga no cuadra con
-su hash: eso no es «no hay anterior», es un fallo.
+Escribe en --out {"version", "ruta", "origen", "sha256"} o, si es la primera versión de la app,
+{"no_aplica": "motivo"}. Sale con 1 si una descarga no cuadra con su hash, o si hay versiones
+anteriores pero ningún instalador comprobable: eso no es «no hay anterior», es un fallo.
 """
 import argparse
 import hashlib
@@ -138,7 +138,25 @@ def buscar(app, repo, version, dest):
         if got != want:
             raise Fallo(f'{tag}/{setup["name"]}: SHA256 {got[:12]}... no es el de referencia {want[:12]}...')
         return {'version': ver, 'ruta': str(ruta), 'origen': f'GitHub Release {tag} de {repo}', 'sha256': got}
-    return {'no_aplica': f'no hay version anterior a {version} publicada ni en las Releases de {repo}'}
+    hay = hay_anteriores(manifest, releases, app, version)
+    if hay:
+        raise Fallo(f'hay versiones anteriores ({hay}) pero ningun instalador con SHA256 comprobable: '
+                    'la actualizacion no se puede probar')
+    return {'no_aplica': f'primera version: no hay ninguna anterior a {version} publicada ni en las Releases de {repo}'}
+
+
+def hay_anteriores(manifest, releases, app, version):
+    """Versiones anteriores a `version` que existen (publicada o con tag); '' si es la primera.
+    Sin esto, «no encontre el instalador» pasaria por «no hay anterior» y la prueba exigida
+    de actualizacion quedaria en no_aplica sin que nadie lo note (revision S-1275)."""
+    entry = next((t for t in manifest.get('tools', []) if t.get('tool') == app), None)
+    pub = (((entry or {}).get('platforms') or {}).get('windows-x64') or {}).get('version') or ''
+    vers = {pub} if re.fullmatch(r'\d+\.\d+\.\d+', pub) and semver(pub) < semver(version) else set()
+    for r in releases:
+        m = TAG_RE.match(r.get('tag_name') or '')
+        if m and not r.get('draft') and semver('.'.join(m.groups())) < semver(version):
+            vers.add('.'.join(m.groups()))
+    return ', '.join(sorted(vers, key=semver, reverse=True)[:3])
 
 
 def main(argv=None):

@@ -602,6 +602,15 @@ def tag_commit(repo, tag):
     return sha
 
 
+def leer_json(path):
+    """Un JSON de la Release; si esta roto devuelve 'ilegible' (no un dict), para que esa app
+    quede fuera con su motivo en vez de tumbar la tanda entera (revision S-1275)."""
+    try:
+        return json.loads(path.read_text(encoding='utf-8-sig'))
+    except (ValueError, UnicodeDecodeError):
+        return 'ilegible'
+
+
 def pruebas_validas(data, slug, ver, commit):
     """Por que el informe de pruebas de Windows de la Release no vale; [] si vale."""
     if not isinstance(data, dict) or not isinstance(data.get('pruebas'), dict):
@@ -617,6 +626,8 @@ def informe_visual(data, fuente):
     """El informe visual de la Release, en la forma que lee release_ficha.publicable()."""
     if data is None:
         return SIN_INFORME_VISUAL
+    if not isinstance(data, dict):     # existe pero no se puede leer: bloquea, no pasa por «sin medida»
+        return {'estado': 'ilegible', 'commit': '', 'medidas': 0, 'fuente': fuente}
     medidas = data.get('medidas')
     return {'estado': str(data.get('estado') or ''), 'commit': str(data.get('commit') or ''),
             'medidas': medidas if isinstance(medidas, int) else 0, 'fuente': fuente}
@@ -807,7 +818,7 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
         pruebas_win = None
         if 'windows' in plats:
             if (dest / names['pruebas']).exists():
-                pruebas_win = json.loads((dest / names['pruebas']).read_text(encoding='utf-8-sig'))
+                pruebas_win = leer_json(dest / names['pruebas'])
                 malas = pruebas_validas(pruebas_win, slug, ver, commit)
                 if malas:
                     rep.fallaria(slug, f"{names['pruebas']} no vale: {'; '.join(malas)}")
@@ -819,7 +830,7 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
                 rep.check(slug, f"la Release no trae {names['pruebas']}")
         visual_data = None
         if (dest / names['visual']).exists():
-            visual_data = json.loads((dest / names['visual']).read_text(encoding='utf-8-sig'))
+            visual_data = leer_json(dest / names['visual'])
         firma = ('Authenticode del instalador' + (' y .sig de Tauri' if tauri else '')
                  + ('; los paquetes de Linux no van firmados' if 'linux' in plats else '')
                  if 'windows' in plats else 'no_aplica: los paquetes de Linux no van firmados')

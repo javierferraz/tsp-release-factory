@@ -193,8 +193,16 @@ function Restore-Machine {
     }
     $deadline = (Get-Date).AddSeconds(60)
     while (@(Get-UninstallEntries).Count -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-    foreach ($d in (Get-TopNew (New-Since (Get-Dirs) $foto.dirs))) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
-    foreach ($k in (Get-TopNew (New-Since (Get-Keys) $foto.keys))) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
+    # Solo lo que pudo crear la app: el mismo filtro que Get-Settings. Temp, pip, Microsoft... son
+    # del runner y de los pasos que siguen (revision S-1275).
+    foreach ($d in (Get-TopNew (New-Since (Get-Dirs) $foto.dirs))) {
+        if ($d -match $noise) { continue }
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($k in (Get-TopNew (New-Since (Get-Keys) $foto.keys))) {
+        if ($k -match '\\Microsoft\\|\\Classes\\') { continue }
+        Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue
+    }
     foreach ($l in (New-Since (Get-Links) $foto.links)) { Remove-Item -LiteralPath $l -Force -ErrorAction SilentlyContinue }
 }
 
@@ -249,7 +257,8 @@ try {
     $detalle = if ($nf + $nr) { "$nf fichero(s) y $nr valor(es) de registro conservados" } else { 'la anterior no guardo ajustes en su primer arranque: no habia nada que comparar' }
     $result = [ordered]@{
         resultado = 'ok'
-        texto = "ok: v$PreviousVersion -> v$Version en el runner ($Kind); $detalle; desinstala limpio"
+        # Sin ajustes que comparar la ficha lo dice en la primera palabra, no solo en el detalle.
+        texto = "ok: $(if ($nf + $nr) { '' } else { 'SIN AJUSTES QUE COMPARAR; ' })v$PreviousVersion -> v$Version en el runner ($Kind); $detalle; desinstala limpio"
         anterior = $PreviousVersion; nueva = $Version; instalador = $Kind
         pasos = @($pasos)
         ajustes = [ordered]@{ ficheros = @($ajustes.ficheros | ForEach-Object { [ordered]@{ ruta = Get-Short $_.ruta; bytes = $_.bytes } }); registro = @($ajustes.registro | ForEach-Object { [ordered]@{ clave = $_.clave; valor = $_.valor } }) }

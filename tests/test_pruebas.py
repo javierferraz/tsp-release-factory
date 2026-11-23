@@ -53,6 +53,15 @@ def test_candidatas_github_ordenadas_y_filtradas():
     assert got == [('1.6.2', 'SnappyWasp-1.6.2-setup.exe'), ('1.5.0', f'{APP}-v1.5.0-windows-x64-setup.exe')]
 
 
+def test_hay_anteriores_distingue_primera_version():
+    # Revision S-1275: «no encontre instalador» no puede pasar por «primera version».
+    rels = [{'tag_name': 'v1.6.3'}, {'tag_name': 'v1.7.0'}, {'tag_name': 'v1.5.0', 'draft': True}]
+    assert anterior.hay_anteriores({'tools': []}, rels, APP, '1.7.0') == '1.6.3'
+    assert anterior.hay_anteriores(manifest('1.6.0'), [], APP, '1.7.0') == '1.6.0'
+    assert anterior.hay_anteriores(manifest('1.7.0'), [{'tag_name': 'v1.7.0'}], APP, '1.7.0') == ''
+    assert anterior.hay_anteriores({'tools': []}, [], APP, '1.0.0') == ''
+
+
 def test_hash_esperado_prefiere_sha256sums_y_si_no_el_digest():
     setup = {'name': 'x-setup.exe', 'digest': 'sha256:' + 'C' * 64}
     sums = f"{'d' * 64}  x-setup.exe\n{'e' * 64}  otro.zip\n"
