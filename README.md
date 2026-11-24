@@ -321,6 +321,13 @@ fallo.
 Añadir una app Tauri nueva = darle acceso a `APPS_TOKEN` sobre su repo y grabar su
 `TAURI_KEY_<SLUG>` (`gh secret set TAURI_KEY_<SLUG> -R javierferraz/tsp-release-factory < <slug>-signing.key`).
 
+**Las claves del actualizador las graba el agente, nunca se le piden a Javier** (Javier, 2026-11-25:
+«no te he dado ninguna tauri key y hemos publicado todo… deja de pedirme estas keys»). Están en el
+PC de Windows, en `%USERPROFILE%\Documents\Animal-Keys\<slug>-signing.key` (y casi todas también en
+la raíz del repo de cada app), sin contraseña. Antes de decir que falta una, busca ahí y compara su
+`.pub` con el `pubkey` de `src-tauri/tauri.conf.json` de la app. No confundir con la firma
+Authenticode general (Azure, secretos `AZURE_*`), que es una sola para toda la suite.
+
 Añadir una app PySide6 nueva = darle acceso a `APPS_TOKEN` sobre su repo (no tiene clave propia)
 y que el repo cumpla lo que lista la cabecera de `build-pyside-windows.yml`; si sus tests no
 corren en Linux, una línea con su slug y el motivo en `config/tests-en-windows.txt`.
