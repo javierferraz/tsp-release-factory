@@ -5,3 +5,4 @@ snappy-wasp  # tests/test_activity_notice.py: 2 tests usan workers.hotkey_listen
 sneaky-spider  # tests/test_prefs.py y test_audit_history.py usan rutas de Windows (C:\exports, SneakySpider\audit_history.json) (run 45027616335, S-658)
 handy-raccoon  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027619064, S-658)
 tappy-woodpecker  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027621778, S-658)
+silent-frog  # tests/test_metrics.py compara el QSS con un fixture de Windows; fuera de win32 theme.py anade reglas al combo (run 45417468982, S-1308)
