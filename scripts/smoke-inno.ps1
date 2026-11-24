@@ -52,14 +52,16 @@ $p = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT', '/SUPPRESSM
 $null = $p.Handle   # sin esto, ExitCode sale vacio al no usar -Wait
 # Mientras instala: el setup extrae y ejecuta un .tmp en %TEMP%\is-*.tmp\. Sin firma, Smart App
 # Control lo bloquea con el error 4551 (S-573); SignTool=stromboli en el .iss lo evita.
+# Se relee hasta verla Valid: leido a medio escribir da UnknownError aunque este firmado (Beaver y
+# Koala fallaron asi y pasaron al repetir con el mismo instalador, S-1308). Sin firma sigue NotSigned.
 $tmpSig = $null
 while (-not $p.HasExited) {
-    if (-not $tmpSig) {
+    if (-not $tmpSig -or $tmpSig.Status -ne 'Valid') {
         $tmp = Get-ChildItem -Path $env:TEMP -Filter 'is-*.tmp' -Directory -ErrorAction SilentlyContinue |
             ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.tmp' -File -ErrorAction SilentlyContinue } |
             Select-Object -First 1
         if ($tmp) {
-            try { $tmpSig = Get-AuthenticodeSignature -FilePath $tmp.FullName } catch { $tmpSig = $null }
+            try { $tmpSig = Get-AuthenticodeSignature -FilePath $tmp.FullName } catch { }
         }
     }
     Start-Sleep -Milliseconds 100
