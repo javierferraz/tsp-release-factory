@@ -8,5 +8,4 @@ tappy-woodpecker  # tests/test_metrics.py compara el QSS con un fixture generado
 silent-frog  # tests/test_metrics.py compara el QSS con un fixture de Windows; fuera de win32 theme.py anade reglas al combo (run 45417468982, S-1308)
 tidy-koala  # app solo Windows (iconos del escritorio): sus tests importan winreg y ctypes.WinDLL (run 45418595527, S-1308)
 orderly-owl  # tests/test_renamer.py inyecta el fallo por el rename de Windows (en Linux el adaptador mueve con os.link) y test_main busca crash.log donde lo deja Windows (run 45482035143, S-1308)
-crafty-fox  # pasan los 130 tests pero pytest aborta al cerrar Qt bajo xvfb (codigo 134, run 45482046219, S-1308)
 funky-monkey  # app solo Windows (tecla Win, user32): tests usan ctypes.WinDLL y rutas C:\ (run 45482667142, S-1308)
