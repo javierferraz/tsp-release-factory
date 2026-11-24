@@ -123,7 +123,7 @@ jobs:
                 fi
                 [ -z "$integradas" ] || resumen "$app $ver: ramas integradas en la principal: $integradas"
               fi
-              if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)"); then
+              if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)" --plan "$plan" --app "$app"); then
                 fuera "no pude subir la versión o sellar el CHANGELOG"; continue
               fi
               read -ra files <<< "$tocados"

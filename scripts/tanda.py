@@ -101,6 +101,8 @@ def plan_app(app, manifest, tag_existe, assets):
     p['crear_tag'] = not tag_existe
     if app.get('ramas') and p['crear_tag']:          # R11: con el tag ya hecho, ya no se integra nada
         p['ramas'] = [{'rama': r['rama'], 'sha': r['sha']} for r in app['ramas']]
+    if app.get('changelog_extra') and p['crear_tag']:  # S-1307: lo que el vigía redactó para el CHANGELOG
+        p['changelog_extra'] = app['changelog_extra']
     p['build_windows'] = 'windows' in app['platforms'] and f'{slug}-v{ver}-windows-x64-setup.exe' not in assets
     p['build_linux'] = 'linux' in app['platforms'] and f'{slug}-v{ver}-linux-x64.AppImage' not in assets
     p['accion'] = 'publicar'
@@ -174,8 +176,38 @@ def subir_version(d, stack, nueva):
     return tocados
 
 
-def sellar_changelog(d, version, fecha):
-    """«## [Unreleased]» → «## [Unreleased]» vacío + «## [X.Y.Z] — fecha». False si ya estaba."""
+SECCIONES = ('Added', 'Changed', 'Fixed', 'Removed', 'Deprecated', 'Security')
+
+
+def anotar_unreleased(texto, extra, nl):
+    """S-1307: mete en «## [Unreleased]» las líneas que el vigía redactó para los cambios visibles
+    sin anotar, cada una al final de su «### Sección» (la crea si falta). Las que ya están, no."""
+    for e in extra:
+        seccion, linea = e.get('seccion'), ' '.join(str(e.get('linea', '')).split())
+        if seccion not in SECCIONES or not linea.startswith('- '):
+            raise Fallo(f'línea de CHANGELOG no válida: {e!r}')
+        m = re.search(r'^## \[Unreleased\][^\r\n]*', texto, re.M)
+        sig = re.compile(r'^## ', re.M).search(texto, m.end())
+        fin = sig.start() if sig else len(texto)
+        cuerpo = texto[m.end():fin]
+        if linea in cuerpo:
+            continue
+        sec = re.search(rf'^### {seccion}\b[^\r\n]*', cuerpo, re.M)
+        if sec:
+            otra = re.compile(r'^### ', re.M).search(cuerpo, sec.end())
+            corte = otra.start() if otra else len(cuerpo)
+            parte = cuerpo[sec.end():corte]
+            sin = parte.rstrip()
+            cuerpo = cuerpo[:sec.end()] + sin + nl + linea + parte[len(sin):] + cuerpo[corte:]
+        else:
+            cuerpo = cuerpo.rstrip() + nl + nl + f'### {seccion}' + nl + linea + (nl + nl if sig else nl)
+        texto = texto[:m.end()] + cuerpo + texto[fin:]
+    return texto
+
+
+def sellar_changelog(d, version, fecha, extra=()):
+    """«## [Unreleased]» → «## [Unreleased]» vacío + «## [X.Y.Z] — fecha». False si ya estaba.
+    Con `extra` (S-1307), antes de sellar añade a Unreleased las líneas que faltaban."""
     cl = d / 'CHANGELOG.md'
     texto = cl.read_bytes().decode('utf-8')
     if re.search(rf'^## \[{re.escape(version)}\]', texto, re.M):
@@ -184,6 +216,9 @@ def sellar_changelog(d, version, fecha):
     m = re.search(r'^## \[Unreleased\][^\r\n]*', texto, re.M)
     if not m:
         raise Fallo('CHANGELOG.md no tiene sección «## [Unreleased]»')
+    if extra:
+        texto = anotar_unreleased(texto, extra, nl)
+        m = re.search(r'^## \[Unreleased\][^\r\n]*', texto, re.M)
     nuevo = texto[:m.end()] + f'{nl}{nl}## [{version}] — {fecha}' + texto[m.end():]
     cl.write_bytes(nuevo.encode('utf-8'))
     return True
@@ -264,6 +299,8 @@ def main(argv=None):
     s.add_argument('--version', required=True)
     s.add_argument('--stack', choices=('tauri', 'pyside'), required=True)
     s.add_argument('--fecha', default=datetime.date.today().isoformat())
+    s.add_argument('--plan', type=Path, help='S-1307: de aquí salen las líneas que el vigía redactó')
+    s.add_argument('--app', default='')
     n = sub.add_parser('notas')
     n.add_argument('--plan', type=Path, required=True)
     n.add_argument('--app', required=True)
@@ -287,10 +324,16 @@ def main(argv=None):
                 que = x.get('motivo') or ', '.join(k for k in ('crear_tag', 'build_windows', 'build_linux') if x.get(k)) or 'solo publicar'
                 if x.get('ramas'):
                     que += ', integra ' + ' '.join(r['rama'] for r in x['ramas'])
+                if x.get('changelog_extra'):
+                    que += f', añade {len(x["changelog_extra"])} línea(s) al CHANGELOG'
                 print(f'{x["app"]} {x["version"]}: {que}')
         elif args.orden == 'sellar':
+            extra = []
+            if args.plan:
+                pl = json.loads(args.plan.read_text(encoding='utf-8'))
+                extra = next((x for x in pl['apps'] if x['app'] == args.app), {}).get('changelog_extra') or []
             tocados = subir_version(args.dir, args.stack, args.version)
-            if sellar_changelog(args.dir, args.version, args.fecha):
+            if sellar_changelog(args.dir, args.version, args.fecha, extra):
                 tocados.append('CHANGELOG.md')
             print(' '.join(tocados))
         elif args.orden == 'integrar':

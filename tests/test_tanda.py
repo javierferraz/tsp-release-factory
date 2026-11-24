@@ -100,6 +100,50 @@ def test_sellar_tauri(tmp_path):
     assert tanda.subir_version(tmp_path, 'tauri', '1.1.0') == []                 # ya está
 
 
+EXTRA = [{'seccion': 'Fixed', 'linea': '- **Otra cosa** arreglada.'},
+         {'seccion': 'Added', 'linea': '- **Nueva** función.'}]
+
+
+def test_sellar_anade_lineas_del_vigia_antes_de_sellar(tmp_path):
+    """S-1307: la línea va al final de su sección; si la sección falta, se crea."""
+    escribir(tmp_path, 'CHANGELOG.md', CHANGELOG)
+    assert tanda.sellar_changelog(tmp_path, '1.6.3', '2026-11-16', EXTRA)
+    cl = (tmp_path / 'CHANGELOG.md').read_bytes().decode()
+    assert cl == ('# Changelog\r\n\r\n## [Unreleased]\r\n\r\n## [1.6.3] — 2026-11-16\r\n\r\n'
+                  '### Fixed\r\n- Algo.\r\n- **Otra cosa** arreglada.\r\n\r\n'
+                  '### Added\r\n- **Nueva** función.\r\n\r\n## [1.6.2] — 2026-10-15\r\n')
+
+
+def test_sellar_con_plan_por_la_cli(tmp_path):
+    escribir(tmp_path, 'utils/version.py', '__version__ = "1.6.2"\n')
+    escribir(tmp_path, 'packaging/SnappyWasp.iss', '#define AppVersion "1.6.2"\n')
+    escribir(tmp_path, 'CHANGELOG.md', '# Changelog\n\n## [Unreleased]\n\n## [1.6.2] — 2026-10-15\n')
+    p = tanda.plan(tanda_de(apps=[{**tanda_de()['apps'][0], 'changelog_extra': EXTRA[:1]}]),
+                   MANIFEST, lambda r, t: (False, set()), LUNES)
+    assert p['apps'][0]['changelog_extra'] == EXTRA[:1]
+    f = tmp_path / 'plan.json'
+    f.write_text(json.dumps(p), encoding='utf-8')
+    assert tanda.main(['sellar', '--dir', str(tmp_path), '--version', '1.6.3', '--stack', 'pyside',
+                       '--fecha', '2026-11-16', '--plan', str(f), '--app', 'snappy-wasp']) == 0
+    cl = (tmp_path / 'CHANGELOG.md').read_text(encoding='utf-8')
+    assert cl == ('# Changelog\n\n## [Unreleased]\n\n## [1.6.3] — 2026-11-16\n\n'
+                  '### Fixed\n- **Otra cosa** arreglada.\n\n## [1.6.2] — 2026-10-15\n')
+
+
+def test_plan_sin_crear_tag_no_lleva_lineas():
+    app = {**tanda_de()['apps'][0], 'changelog_extra': EXTRA}
+    x = tanda.plan(tanda_de(apps=[app]), MANIFEST, lambda r, t: (True, set()), LUNES)['apps'][0]
+    assert 'changelog_extra' not in x
+
+
+def test_sellar_no_duplica_ni_acepta_secciones_raras(tmp_path):
+    escribir(tmp_path, 'CHANGELOG.md', CHANGELOG)
+    texto = tanda.anotar_unreleased(CHANGELOG, [{'seccion': 'Fixed', 'linea': '- Algo.'}], '\r\n')
+    assert texto == CHANGELOG
+    with pytest.raises(tanda.Fallo, match='no válida'):
+        tanda.sellar_changelog(tmp_path, '1.6.3', '2026-11-16', [{'seccion': 'Rotas', 'linea': '- x'}])
+
+
 def test_sellar_sin_unreleased_falla(tmp_path):
     escribir(tmp_path, 'CHANGELOG.md', '# Changelog\n\n## [1.0.0]\n')
     with pytest.raises(tanda.Fallo, match='Unreleased'):
