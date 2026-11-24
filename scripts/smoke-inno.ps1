@@ -48,16 +48,20 @@ if (Get-UninstallEntry) { Fail 'Maquina limpia' "ya habia una instalacion con Ap
 
 # 1. Instalar en silencio. [Run] postinstall lleva skipifsilent: no arranca la app.
 $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
+# Carpetas is-*.tmp de antes (la prueba de actualizacion deja ahi las copias temporales de los
+# desinstaladores, a medio borrar): no son el .tmp de este setup y leidas dan UnknownError (S-1308).
+$tmpPrevias = @(Get-ChildItem -Path $env:TEMP -Filter 'is-*.tmp' -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
 $p = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=`"$log`"" -PassThru
 $null = $p.Handle   # sin esto, ExitCode sale vacio al no usar -Wait
 # Mientras instala: el setup extrae y ejecuta un .tmp en %TEMP%\is-*.tmp\. Sin firma, Smart App
 # Control lo bloquea con el error 4551 (S-573); SignTool=stromboli en el .iss lo evita.
-# Se relee hasta verla Valid: leido a medio escribir da UnknownError aunque este firmado (Beaver y
-# Koala fallaron asi y pasaron al repetir con el mismo instalador, S-1308). Sin firma sigue NotSigned.
+# Se relee hasta verla Valid (leido a medio escribir tambien puede salir UnknownError). Sin firma
+# sigue NotSigned y falla.
 $tmpSig = $null
 while (-not $p.HasExited) {
     if (-not $tmpSig -or $tmpSig.Status -ne 'Valid') {
         $tmp = Get-ChildItem -Path $env:TEMP -Filter 'is-*.tmp' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $tmpPrevias -notcontains $_.Name } |
             ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.tmp' -File -ErrorAction SilentlyContinue } |
             Select-Object -First 1
         if ($tmp) {
@@ -72,7 +76,7 @@ Add-Row 'Instalar (/VERYSILENT)' 'codigo de salida 0'
 if (-not $tmpSig) {
     Add-Row 'Firma del .tmp interno (aviso)' 'no se llego a ver el .tmp mientras instalaba; sin comprobar'
 } elseif ($tmpSig.Status -ne 'Valid') {
-    Fail 'Firma del .tmp interno' "$($tmpSig.Status): el setup ejecuta un .tmp sin firma valida (error 4551 con Smart App Control, S-573)"
+    Fail 'Firma del .tmp interno' "$($tmpSig.Status) en $(Split-Path -Leaf (Split-Path -Parent $tmpSig.Path))\$(Split-Path -Leaf $tmpSig.Path) ($($tmpSig.StatusMessage)): el setup ejecuta un .tmp sin firma valida (error 4551 con Smart App Control, S-573)"
 } else {
     Add-Row 'Firma del .tmp interno' "valida; firmante $($tmpSig.SignerCertificate.Subject -replace '^CN=([^,]+).*', '$1')"
 }
