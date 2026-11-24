@@ -6,3 +6,4 @@ sneaky-spider  # tests/test_prefs.py y test_audit_history.py usan rutas de Windo
 handy-raccoon  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027619064, S-658)
 tappy-woodpecker  # tests/test_metrics.py compara el QSS con un fixture generado en Windows (run 45027621778, S-658)
 silent-frog  # tests/test_metrics.py compara el QSS con un fixture de Windows; fuera de win32 theme.py anade reglas al combo (run 45417468982, S-1308)
+tidy-koala  # app solo Windows (iconos del escritorio): sus tests importan winreg y ctypes.WinDLL (run 45418595527, S-1308)
