@@ -78,6 +78,9 @@ doble): si el primero falla, el de Windows ni arranca.
 5. `pyinstaller <App>.spec` con el PATH reducido al entorno y a Windows (con el de Git delante,
    PyInstaller empaqueta su OpenSSL); falla si aparece `libssl-3-x64`, `libcrypto-3-x64` o una
    DLL de MSYS. Firma `dist\<App>\<App>.exe` con `signing/sign.cmd` y `signtool verify /pa`.
+   Si el repo trae `packaging/windows/factory-extras.ps1`, lo ejecuta con `-Dist dist\<App>` en un
+   paso aparte, sin los secretos de firma: es para lo que PyInstaller no ve (el FFmpeg de Mighty
+   Bison, S-1308).
 6. Inno Setup 6.7.3 (la versión del portátil) bajado de la Release de `jrsoftware/issrc`,
    comprobado por hash y por firma, instalado en el job. `ISCC /Sstromboli=<sign.cmd> $f`
    compila el `.iss` del repo de la app sin tocarlo: Inno firma el desinstalador, el `.tmp` que

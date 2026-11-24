@@ -428,6 +428,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa falla en $env:NAME.exe" }
           "| Authenticode del .exe | $env:NAME.exe: signtool verify /pa OK |" >> $env:REPORT
 
+      # Lo que una app anade al bundle y PyInstaller no ve (S-1308: el FFmpeg de Mighty Bison, que
+      # su build.ps1 copiaba a mano). Opcional: solo si el repo trae packaging/windows/factory-extras.ps1.
+      # Paso aparte y sin los secretos de firma en el entorno: es codigo del repo de la app.
+      - name: Extras de la app en el bundle (factory-extras.ps1)
+        working-directory: app
+        run: |
+          $extras = 'packaging/windows/factory-extras.ps1'
+          if (-not (Test-Path $extras)) { "| Extras del bundle | ninguno |" >> $env:REPORT; exit 0 }
+          $dist = Join-Path (Get-Location) "dist\$env:NAME"
+          $before = @(Get-ChildItem $dist -Recurse -File).Count
+          & (Resolve-Path $extras).Path -Dist $dist
+          if (-not $?) { throw "$extras falla" }
+          $added = @(Get-ChildItem $dist -Recurse -File).Count - $before
+          "| Extras del bundle | $extras`: $added ficheros nuevos en dist\$env:NAME\ |" >> $env:REPORT
+
       # SignTool=stromboli: Inno firma con sign.cmd el desinstalador, el .tmp que el setup extrae
       # en %TEMP% y el propio instalador (sin el .tmp firmado, Smart App Control da el error 4551,
       # S-573). ISCC aborta si un fichero que debia firmar sale sin firma.
