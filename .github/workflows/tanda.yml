@@ -98,7 +98,7 @@ jobs:
             [ -n "$url" ] || { echo "no pude lanzar $wf"; return 1; }
             id=${url##*/}
             echo "$wf -> $url"
-            GH_TOKEN=$FACTORY_TOKEN gh run watch "$id" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null || rc=$?
+            GH_TOKEN=$FACTORY_TOKEN bash "$GITHUB_WORKSPACE/scripts/vigilar_run.sh" "$id" "$GITHUB_REPOSITORY" || rc=$?   # S-1327
             case "$wf" in *windows*) so=windows ;; *) so=linux ;; esac
             echo "$so $(GH_TOKEN=$FACTORY_TOKEN gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.startedAt != null and .completedAt != null) | (((.completedAt | fromdate) - (.startedAt | fromdate)) / 60 | ceil)] | add // 0' 2>/dev/null || echo 0)" >> "$T/minutos.txt"
             return $rc
@@ -124,7 +124,7 @@ jobs:
                 [ -z "$integradas" ] || resumen "$app $ver: ramas integradas en la principal: $integradas"
               fi
               if ! tocados=$(cd "$dir" && python3 "$GITHUB_WORKSPACE/scripts/tanda.py" sellar --dir . --version "$ver" --stack "$stack" --fecha "$(date -u +%F)" --plan "$plan" --app "$app"); then
-                fuera "no pude subir la versión o sellar el CHANGELOG"; continue
+                fuera "no pude subir la versión o sellar el CHANGELOG (${tocados#::error::})"; continue   # S-1327: con el motivo
               fi
               read -ra files <<< "$tocados"
               ( cd "$dir" && git add -- "${files[@]}" && git commit -q -m "release: v$ver (tanda $(jq -r .fecha "$plan"))" && git tag -a "$tag" -m "$tag" )                 || { fuera "no pude hacer el commit o el tag"; continue; }
@@ -205,7 +205,7 @@ jobs:
           echo "- publish.yml: $url" >> "$GITHUB_STEP_SUMMARY"
           echo "$url" > "$T/publish_run.txt"
           id=${url##*/} rc=0
-          GH_TOKEN=$FACTORY_TOKEN gh run watch "$id" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null || rc=$?
+          GH_TOKEN=$FACTORY_TOKEN bash "$GITHUB_WORKSPACE/scripts/vigilar_run.sh" "$id" "$GITHUB_REPOSITORY" || rc=$?   # S-1327
           echo "linux $(GH_TOKEN=$FACTORY_TOKEN gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.startedAt != null and .completedAt != null) | (((.completedAt | fromdate) - (.startedAt | fromdate)) / 60 | ceil)] | add // 0' 2>/dev/null || echo 0)" >> "$T/minutos.txt"
           # resultado.json de publish.py: qué app se publicó y cuál no, para el cierre (R9)
           GH_TOKEN=$FACTORY_TOKEN gh run download "$id" -R "$GITHUB_REPOSITORY" -n "publish-$id" -D "$T/publish" || echo "sin artefacto de publish.yml"

@@ -100,6 +100,30 @@ def test_sellar_tauri(tmp_path):
     assert tanda.subir_version(tmp_path, 'tauri', '1.1.0') == []                 # ya está
 
 
+def test_sellar_tauri_con_package_lock_desfasado(tmp_path):
+    """S-1327: la tanda del 26-11 dejó fuera Clever Cat (lock en 1.4.8, app en 1.8.6) y Tiny Chicken
+    (lock en 1.7.1, app en 1.8.0) con «package-lock.json: esperaba 2 versión(es) que cambiar y hay 0».
+    La versión propia del lock es solo un dato (npm la reescribe): se pone la nueva sea cual sea la vieja."""
+    escribir(tmp_path, 'src-tauri/tauri.conf.json', '{\n  "productName": "Clever Cat",\n  "version": "1.8.6",\n  "identifier": "x"\n}\n')
+    escribir(tmp_path, 'package.json', '{\n  "name": "clever-cat",\n  "version": "1.8.6",\n  "dependencies": {"a": "1.4.8"}\n}\n')
+    escribir(tmp_path, 'package-lock.json', '{\r\n  "name": "clever-cat",\r\n  "version": "1.4.8",\r\n  "lockfileVersion": 3,\r\n  "packages": {\r\n    "": {\r\n      "name": "clever-cat",\r\n      "version": "1.4.8"\r\n    },\r\n    "node_modules/a": {\r\n      "version": "1.4.8"\r\n    }\r\n  }\r\n}\r\n')
+    escribir(tmp_path, 'src-tauri/Cargo.toml', '[package]\nname = "clever-cat"\nversion = "1.8.6"\n')
+    assert 'package-lock.json' in tanda.subir_version(tmp_path, 'tauri', '1.9.0')
+    lock = json.loads((tmp_path / 'package-lock.json').read_text())
+    assert (lock['version'], lock['packages']['']['version'], lock['packages']['node_modules/a']['version']) == ('1.9.0', '1.9.0', '1.4.8')
+    assert b'\r\n' in (tmp_path / 'package-lock.json').read_bytes()           # respeta los finales de línea
+
+
+def test_sellar_tauri_lock_sin_su_nombre_sigue_fallando(tmp_path):
+    """Lo desfasado se tolera; un lock que no es de esta app (otro nombre) sigue parando la tanda."""
+    escribir(tmp_path, 'src-tauri/tauri.conf.json', '{\n  "version": "1.0.0"\n}\n')
+    escribir(tmp_path, 'package.json', '{\n  "name": "bright-cardinal",\n  "version": "1.0.0"\n}\n')
+    escribir(tmp_path, 'package-lock.json', '{\n  "name": "otra-app",\n  "version": "1.0.0",\n  "packages": {\n    "": {\n      "name": "otra-app",\n      "version": "1.0.0"\n    }\n  }\n}\n')
+    escribir(tmp_path, 'src-tauri/Cargo.toml', '[package]\nname = "bright-cardinal"\nversion = "1.0.0"\n')
+    with pytest.raises(tanda.Fallo, match='package-lock.json'):
+        tanda.subir_version(tmp_path, 'tauri', '1.1.0')
+
+
 EXTRA = [{'seccion': 'Fixed', 'linea': '- **Otra cosa** arreglada.'},
          {'seccion': 'Added', 'linea': '- **Nueva** función.'}]
 

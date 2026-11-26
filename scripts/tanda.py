@@ -149,7 +149,11 @@ def subir_version(d, stack, nueva):
         tocados += ['src-tauri/tauri.conf.json', 'package.json']
         lock = d / 'package-lock.json'
         if lock.is_file():                                  # la raíz y packages[""]
-            _sub_una(lock, rf'^(\s*"version":\s*"){v}"', rf'\g<1>{nueva}"', cuantas=2)
+            # S-1327: la versión del lock se queda atrás si una release a mano no corre `npm install`
+            # (Clever Cat 1.4.8 con la app en 1.8.6): se reconoce por el nombre, no por la versión vieja.
+            nombre = json.loads((d / 'package.json').read_text(encoding='utf-8'))['name']
+            _sub_una(lock, rf'^(\s*"name":\s*"{re.escape(nombre)}",\r?\n\s*"version":\s*")[^"]*"',
+                     rf'\g<1>{nueva}"', cuantas=2)
             tocados.append('package-lock.json')
         cargo = d / 'src-tauri/Cargo.toml'
         crate = re.search(r'^name\s*=\s*"([^"]+)"', cargo.read_text(encoding='utf-8'), re.M).group(1)
