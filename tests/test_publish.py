@@ -141,6 +141,19 @@ def test_apply_plan_app_nueva():
     assert entry['release_date'] == '2026-11-10'
 
 
+def test_apply_plan_entrada_de_reserva_pasa_a_stable_con_su_nombre():
+    entry = {'tool': 'c', 'display_name': 'C Old', 'version': '0.1.0', 'channel': 'dev',
+             'notes_url': None, 'platforms': {'windows-x64': publish.planned_block('nsis')}}
+    manifest = {'tools': [entry]}
+    setup = {'name': 'c-v1.0.0-windows-x64-setup.exe', 'size': 10, 'sha256': SHA_A}
+    plan = {'app': 'c', 'version': '1.0.0', 'display_name': 'C App',
+            'notes_url': 'https://github.com/javierferraz/c/blob/main/CHANGELOG.md',
+            'windows_block': publish.windows_block(None, 'c', '1.0.0', setup, None, 'nsis', 'First.')}
+    publish.apply_plan(manifest, plan, '2026-11-27')
+    assert (entry['channel'], entry['display_name'], entry['version']) == ('stable', 'C App', '1.0.0')
+    assert entry['notes_url'].endswith('/CHANGELOG.md')
+
+
 def test_apply_plan_sin_cambios_no_toca_la_fecha():
     entry = {'tool': 'c', 'version': '1.0.0', 'release_date': '2026-10-01', 'platforms': {}}
     manifest = {'tools': [entry]}

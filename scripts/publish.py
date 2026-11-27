@@ -389,6 +389,8 @@ def apply_plan(manifest, plan, today):
         entry['platforms']['windows-x64'] = plan['windows_block']
         entry['version'] = plan['version']
         entry['release_date'] = today
+        if entry.get('channel') != 'stable':   # la entrada de reserva de F0-F3 pasa a publicada
+            entry.update(channel='stable', display_name=plan['display_name'], notes_url=plan['notes_url'])
     if plan.get('linux_block'):
         entry['platforms']['linux-x64'] = plan['linux_block']
     return entry
@@ -874,7 +876,9 @@ def prepare(spec, manifest, central, work, rep, notes_override, notes_url_branch
         plan['ficha_previa'] = dest / names['ficha'] if (dest / names['ficha']).exists() else None
         plan['ficha_nombre'] = names['ficha']
 
-    if entry is None:
+    # Una entrada de reserva (canal dev, de F0-F3) cuenta como app nueva: nombre del catálogo y
+    # canal stable. Quiet Panda 1.3.0 salió en dev y con el nombre de junio (2026-11-27).
+    if entry is None or entry.get('channel') != 'stable':
         if 'windows_block' not in plan:
             raise Fallo('app nueva en el manifest sin Windows en la tanda')
         plan['display_name'] = display_name(central, slug)
