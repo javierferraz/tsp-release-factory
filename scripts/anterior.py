@@ -23,6 +23,7 @@ anteriores pero ningún instalador comprobable: eso no es «no hay anterior», e
 """
 import argparse
 import hashlib
+import http.client
 import json
 import re
 import subprocess
@@ -145,8 +146,8 @@ def instalador_publicado(repo, ver, url, sha, dest):
     ruta = dest / url.rsplit('/', 1)[1]
     try:
         ctype = descargar(url, ruta)
-    except OSError as e:
-        motivo = f'no contestó ({e})'
+    except (OSError, http.client.HTTPException) as e:  # p. ej. IncompleteRead a mitad de descarga
+        motivo = f'no contestó ({e!r})'
     else:
         got = sha256(ruta)
         if got == sha:

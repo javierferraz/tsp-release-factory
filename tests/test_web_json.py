@@ -165,7 +165,8 @@ def falla_con(e):
 
 def test_latest_en_html_queda_como_aviso():
     rep = Rep()
-    publish.latest_en_vivo('snappy-wasp-latest.json', '1.7.0', rep, leer=falla_con(NoEsJSON('x', html=True)))
+    error = NoEsJSON('x (HTTP 200, text/html, 12199 bytes, título «One moment, please...»)', html=True)
+    publish.latest_en_vivo('snappy-wasp-latest.json', '1.7.0', rep, leer=falla_con(error))
     assert len(rep.avisos) == 1 and 'HTML' in rep.avisos[0]
 
 
@@ -177,6 +178,29 @@ def test_latest_con_otra_version_sigue_parando():
 def test_latest_roto_que_no_es_html_sigue_parando():
     with pytest.raises(publish.Fallo, match='no da JSON'):
         publish.latest_en_vivo('a-latest.json', '1.7.0', Rep(), leer=falla_con(NoEsJSON('x', html=False)))
+
+
+def test_http_json_real_lee_de_la_web(hosting, monkeypatch):
+    """Revisión de S-1352: el leer_json(path) del propio publish.py tapaba al de web_json y
+    http_json reventaba con TypeError en la puerta 6d real (los demás tests inyectan `leer`)."""
+    url, cola = hosting
+    cola += [('text/html', PAGINA), ('application/json', b'{"version": "1.7.0"}')]
+    monkeypatch.setattr(publish, 'UPDATES_PREFIX', f'{url}/updates/')
+    monkeypatch.setattr(web_json.time, 'sleep', lambda s: None)
+    rep = Rep()
+    publish.latest_en_vivo('a-latest.json', '1.7.0', rep)
+    assert rep.avisos == []
+
+
+def test_html_que_no_es_la_pagina_de_espera_sigue_parando():
+    error = NoEsJSON('x (HTTP 200, text/html, 900 bytes, título «503 Service Unavailable»)', html=True)
+    with pytest.raises(publish.Fallo, match='no da JSON'):
+        publish.latest_en_vivo('a-latest.json', '1.7.0', Rep(), leer=falla_con(error))
+
+
+def test_latest_que_no_es_un_objeto_para_con_fallo():
+    with pytest.raises(publish.Fallo, match='no da JSON'):
+        publish.latest_en_vivo('a-latest.json', '1.7.0', Rep(), leer=lambda u: ['1.7.0'])
 
 
 def test_latest_correcto_no_avisa():

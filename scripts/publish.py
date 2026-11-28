@@ -63,7 +63,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from web_json import NoEsJSON, leer_json
+from web_json import NoEsJSON, leer_json as leer_json_web
 
 FACTORY = Path(__file__).resolve().parent.parent
 SITE = 'https://thestromboliproject.com'
@@ -1285,7 +1285,7 @@ def simular_deploy(central, mock, salida):
 
 def http_json(url, intentos=4, pausa=20):
     """S-1352: con reintentos; desde los runners el hosting sirve a veces HTML en vez del JSON."""
-    return leer_json(url, 'tsp-release-factory/1.0', intentos=intentos, pausa=pausa)
+    return leer_json_web(url, 'tsp-release-factory/1.0', intentos=intentos, pausa=pausa)
 
 
 def latest_en_vivo(fname, version, rep, leer=http_json):
@@ -1296,13 +1296,17 @@ def latest_en_vivo(fname, version, rep, leer=http_json):
     try:
         live = leer(url)
     except NoEsJSON as e:
-        if not e.html:
+        # Solo la página de espera de la protección del hosting es aviso; otra página HTML
+        # (una caída, un 404 servido con 200) sigue parando.
+        if not (e.html and 'One moment, please' in str(e)):
             raise Fallo(f'{url} no da JSON: {e}') from None
         rep.avisos.append(f'{url} no se pudo comprobar en vivo: el hosting sirvio HTML en todos los '
                           f'intentos ({e}). El FTP ya lo comprobo igual al local.')
         return
     except OSError as e:
         raise Fallo(f'{url} no se pudo leer: {e}') from None
+    if not isinstance(live, dict):
+        raise Fallo(f'{url} no da JSON de latest: {json.dumps(live)[:80]}')
     if live.get('version') != version:
         raise Fallo(f'{url} sirve {live.get("version")}, no {version}')
 
