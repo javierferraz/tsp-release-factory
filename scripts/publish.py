@@ -61,8 +61,9 @@ import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.request
 from pathlib import Path
+
+from web_json import NoEsJSON, leer_json
 
 FACTORY = Path(__file__).resolve().parent.parent
 SITE = 'https://thestromboliproject.com'
@@ -1265,10 +1266,28 @@ def seed_site_manifest(central, mock):
     mock.seed('/site-manifest.json', data)
 
 
-def http_json(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'tsp-release-factory/1.0', 'Cache-Control': 'no-cache'})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode('utf-8'))
+def http_json(url, intentos=4, pausa=20):
+    """S-1352: con reintentos; desde los runners el hosting sirve a veces HTML en vez del JSON."""
+    return leer_json(url, 'tsp-release-factory/1.0', intentos=intentos, pausa=pausa)
+
+
+def latest_en_vivo(fname, version, rep, leer=http_json):
+    """Puerta 6d: *-latest.json en vivo sirve `version`. Si el hosting solo da HTML (protección
+    antibots), queda como aviso: el paso 4-6a ya comprobó por FTP que latest es el local. Una versión
+    distinta, o un JSON roto o un error que no es esa página, siguen parando."""
+    url = f'{UPDATES_PREFIX}{fname}'
+    try:
+        live = leer(url)
+    except NoEsJSON as e:
+        if not e.html:
+            raise Fallo(f'{url} no da JSON: {e}') from None
+        rep.avisos.append(f'{url} no se pudo comprobar en vivo: el hosting sirvio HTML en todos los '
+                          f'intentos ({e}). El FTP ya lo comprobo igual al local.')
+        return
+    except OSError as e:
+        raise Fallo(f'{url} no se pudo leer: {e}') from None
+    if live.get('version') != version:
+        raise Fallo(f'{url} sirve {live.get("version")}, no {version}')
 
 
 # ───────────────────────────── resumen ─────────────────────────────
@@ -1474,9 +1493,7 @@ def main(argv=None):
                 run([sys.executable, str(central / 'scripts' / 'validate_manifest.py'), '--no-update', '--slug',
                      plan['app']], cwd=str(central), log=work / 'audit.log')
                 for fname in plan['latest']:
-                    live = http_json(f'{UPDATES_PREFIX}{fname}?nocache={int(time.time())}')
-                    if live.get('version') != plan['version']:
-                        raise Fallo(f'{UPDATES_PREFIX}{fname} sirve {live.get("version")}, no {plan["version"]}')
+                    latest_en_vivo(fname, plan['version'], rep)
             detail += '; validate_manifest --slug (HEAD y tamano en vivo) y *-latest.json en vivo OK'
         rep.paso('6d. Puerta', 'ok', detail)
 

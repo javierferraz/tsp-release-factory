@@ -12,6 +12,11 @@ Por orden:
      vX.Y.Z más alto por debajo de --version que tenga instalador de Windows, comprobado contra
      el SHA256SUMS de esa Release o el digest que da GitHub del fichero.
 
+S-1352: desde los runners el hosting sirve a veces una página HTML en vez del manifest o del
+instalador. Si la web no da el manifest tras los reintentos, se lee el mismo updates/manifest.json
+del central en GitHub; si no da el instalador, se baja de la Release vX.Y.Z de la app y se exige
+el MISMO SHA256 del manifest. Un binario que llega con otro hash sigue siendo un fallo.
+
 Escribe en --out {"version", "ruta", "origen", "sha256"} o, si es la primera versión de la app,
 {"no_aplica": "motivo"}. Sale con 1 si una descarga no cuadra con su hash, o si hay versiones
 anteriores pero ningún instalador comprobable: eso no es «no hay anterior», es un fallo.
@@ -25,8 +30,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from web_json import describir, es_html, leer_json
+
 MANIFEST_URL = 'https://thestromboliproject.com/updates/manifest.json'
 TAG_RE = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+CENTRAL_REPO = 'javierferraz/2606-thestromboliproject'
+UA = 'tsp-release-factory'
 
 
 class Fallo(Exception):
@@ -101,26 +110,70 @@ def gh(*args):
     return p.stdout
 
 
+def leer_manifest():
+    """(manifest, origen): de la web con reintentos y, si no lo da, del central en GitHub (S-1352)."""
+    try:
+        return leer_json(MANIFEST_URL, UA, intentos=3, pausa=15,
+                         valido=lambda m: isinstance(m, dict) and bool(m.get('tools'))), 'web'
+    except Exception as e:  # noqa: BLE001
+        print(f'la web no dio el manifest ({e}); se lee updates/manifest.json del central en GitHub', flush=True)
+    try:
+        m = json.loads(gh('api', f'repos/{CENTRAL_REPO}/contents/updates/manifest.json',
+                          '-H', 'Accept: application/vnd.github.raw'))
+    except (Fallo, ValueError) as e:
+        raise Fallo(f'no pude leer el manifest ni de la web ni del central en GitHub: {e}') from None
+    if not (isinstance(m, dict) and m.get('tools')):
+        raise Fallo('el manifest del central en GitHub no tiene apps')
+    return m, f'central en GitHub ({CENTRAL_REPO})'
+
+
+def descargar(url, ruta):
+    """Baja `url` a `ruta`; devuelve el Content-Type."""
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=600) as r, open(ruta, 'wb') as fh:
+        while True:
+            b = r.read(1 << 20)
+            if not b:
+                break
+            fh.write(b)
+        return r.headers.get('Content-Type')
+
+
+def instalador_publicado(repo, ver, url, sha, dest):
+    """(ruta, origen) del instalador publicado, con el SHA256 del manifest. Del hosting y, si este
+    sirve HTML o no contesta, de la Release v<ver> de la app (el mismo fichero, S-1352)."""
+    ruta = dest / url.rsplit('/', 1)[1]
+    try:
+        ctype = descargar(url, ruta)
+    except OSError as e:
+        motivo = f'no contestó ({e})'
+    else:
+        got = sha256(ruta)
+        if got == sha:
+            return ruta, f'manifest publicado ({url})'
+        with open(ruta, 'rb') as fh:
+            cabeza = fh.read(20000)
+        if not es_html(ctype, cabeza):
+            raise Fallo(f'{ruta.name}: SHA256 {got[:12]}... no es el del manifest {sha[:12]}...')
+        motivo = f'sirvió HTML ({describir(200, ctype, cabeza)})'
+    print(f'el hosting {motivo}; se baja {ruta.name} de la Release v{ver} de {repo}', flush=True)
+    sub = dest / f'v{ver}'
+    gh('release', 'download', f'v{ver}', '-R', repo, '-p', ruta.name, '-D', str(sub), '--clobber')
+    ruta = sub / ruta.name
+    got = sha256(ruta)
+    if got != sha:
+        raise Fallo(f'v{ver}/{ruta.name}: SHA256 {got[:12]}... no es el del manifest {sha[:12]}...')
+    return ruta, f'GitHub Release v{ver} de {repo} (el hosting no lo dio; SHA256 del manifest publicado)'
+
+
 def buscar(app, repo, version, dest):
     dest.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(urllib.request.Request(
-            MANIFEST_URL, headers={'User-Agent': 'tsp-release-factory'}), timeout=60) as r:
-        manifest = json.loads(r.read().decode('utf-8'))
+    manifest, _ = leer_manifest()
     pub = desde_manifest(manifest, app, version)
     if pub:
         ver, url, sha = pub
-        ruta = dest / url.rsplit('/', 1)[1]
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'tsp-release-factory'}),
-                                    timeout=600) as r, open(ruta, 'wb') as fh:
-            while True:
-                b = r.read(1 << 20)
-                if not b:
-                    break
-                fh.write(b)
-        got = sha256(ruta)
-        if got != sha:
-            raise Fallo(f'{ruta.name}: SHA256 {got[:12]}... no es el del manifest {sha[:12]}...')
-        return {'version': ver, 'ruta': str(ruta), 'origen': f'manifest publicado ({url})', 'sha256': got}
+        ruta, origen = instalador_publicado(repo, ver, url, sha, dest)
+        return {'version': ver, 'ruta': str(ruta), 'origen': origen, 'sha256': sha}
 
     releases = json.loads(gh('api', f'repos/{repo}/releases?per_page=100'))
     for ver, tag, setup, assets in candidatas_github(releases, app, version):
