@@ -1264,6 +1264,10 @@ def seed_site_manifest(central, mock):
     files = deploy_site.collect_local_files(str(central / 'site'))
     data = json.dumps({k: v[1] for k, v in files.items()}, ensure_ascii=False, indent=2).encode('utf-8')
     mock.seed('/site-manifest.json', data)
+    # S-1352: las fichas de las apps tal como están en main (= lo desplegado, en seco). La puerta
+    # (audit_releases) las lee por FTP; sin ellas todas salían «sin desplegar».
+    for ficha in sorted((central / 'site' / 'tools').glob('*/index.html')):
+        mock.seed(f'/tools/{ficha.parent.name}/index.html', ficha.read_bytes())
 
 
 def simular_deploy(central, mock, salida):

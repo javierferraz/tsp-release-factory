@@ -208,3 +208,31 @@ def test_en_seco_el_deploy_simulado_deja_las_fichas_en_el_ftp_simulado(tmp_path)
     listed = publish.simular_deploy(tmp_path, mock, salida)
     assert listed[0] == '/tools/handy-raccoon/index.html'
     assert mock.ficheros == {'/tools/handy-raccoon/index.html': ficha.read_bytes()}
+
+
+def test_en_seco_el_ftp_simulado_arranca_con_las_fichas_de_main(tmp_path, monkeypatch):
+    """Reproduce el ensayo 46178466382: las fichas de las apps que no estaban en la tanda salían
+    «sin desplegar» porque el FTP simulado no tenía ninguna."""
+    for slug in ('silent-frog', 'clever-cat'):
+        f = tmp_path / 'site' / 'tools' / slug / 'index.html'
+        f.parent.mkdir(parents=True)
+        f.write_bytes(slug.encode())
+
+    class Deploy:
+        @staticmethod
+        def collect_local_files(site):
+            return {'/tools/silent-frog/index.html': ('x', 'h1')}
+
+    class Mock:
+        def __init__(self):
+            self.ficheros = {}
+
+        def seed(self, rel, data):
+            self.ficheros[rel] = data
+
+    monkeypatch.setattr(publish, 'load_central_module', lambda central, name: Deploy)
+    mock = Mock()
+    publish.seed_site_manifest(tmp_path, mock)
+    assert mock.ficheros['/tools/silent-frog/index.html'] == b'silent-frog'
+    assert mock.ficheros['/tools/clever-cat/index.html'] == b'clever-cat'
+    assert json.loads(mock.ficheros['/site-manifest.json']) == {'/tools/silent-frog/index.html': 'h1'}
