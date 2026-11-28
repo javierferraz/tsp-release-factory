@@ -183,3 +183,28 @@ def test_latest_correcto_no_avisa():
     rep = Rep()
     publish.latest_en_vivo('a-latest.json', '1.7.0', rep, leer=lambda u: {'version': '1.7.0'})
     assert rep.avisos == []
+
+
+# ── publish.py, despliegue simulado en seco (6c) ──
+
+def test_en_seco_el_deploy_simulado_deja_las_fichas_en_el_ftp_simulado(tmp_path):
+    """Reproduce el ensayo 46178211357: la puerta veía las fichas de la tanda «sin desplegar»."""
+    ficha = tmp_path / 'site' / 'tools' / 'handy-raccoon' / 'index.html'
+    ficha.parent.mkdir(parents=True)
+    ficha.write_bytes(b'<a href="/releases/handy-raccoon/v1.9.1/x.exe">')
+    (tmp_path / 'secreto.txt').write_text('no')
+
+    class Mock:
+        def __init__(self):
+            self.ficheros = {}
+
+        def seed(self, rel, data):
+            self.ficheros[rel] = data
+
+    salida = ('Conectando...\n12 ficheros a subir\n\n[DRY-RUN] Ficheros que se subirían:\n'
+              '  /tools/handy-raccoon/index.html  (31.2 KB)\n  /../secreto.txt  (0.1 KB)\n'
+              '  /tools/no-existe/index.html  (1.0 KB)\n')
+    mock = Mock()
+    listed = publish.simular_deploy(tmp_path, mock, salida)
+    assert listed[0] == '/tools/handy-raccoon/index.html'
+    assert mock.ficheros == {'/tools/handy-raccoon/index.html': ficha.read_bytes()}

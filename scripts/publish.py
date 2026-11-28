@@ -1266,6 +1266,19 @@ def seed_site_manifest(central, mock):
     mock.seed('/site-manifest.json', data)
 
 
+def simular_deploy(central, mock, salida):
+    """En seco, lo que deploy_site.py --dry-run subiría se copia al FTP simulado, como ya se hace
+    con los binarios en 4-6a. Sin esto, la puerta (audit_releases lee la ficha por FTP) veía las
+    fichas de la tanda «sin desplegar» y todo ensayo con versión nueva acababa en rojo (S-1352)."""
+    listed = re.findall(r'^\s+(/\S+)\s+\(', salida.split('[DRY-RUN] Ficheros que se subir', 1)[-1], re.M)
+    site = (central / 'site').resolve()
+    for rel in listed:
+        src = (site / rel.lstrip('/')).resolve()
+        if src.is_relative_to(site) and src.is_file():
+            mock.seed(rel, src.read_bytes())
+    return listed
+
+
 def http_json(url, intentos=4, pausa=20):
     """S-1352: con reintentos; desde los runners el hosting sirve a veces HTML en vez del JSON."""
     return leer_json(url, 'tsp-release-factory/1.0', intentos=intentos, pausa=pausa)
@@ -1465,7 +1478,7 @@ def main(argv=None):
             out = run([sys.executable, str(central / 'scripts' / 'deploy_site.py'), '--dry-run'],
                       cwd=str(central), log=work / 'deploy.log').stdout
             m = re.search(r'(\d+) ficheros a subir', out)
-            listed = re.findall(r'^\s+(/\S+)\s+\(', out.split('[DRY-RUN] Ficheros que se subir', 1)[-1], re.M)
+            listed = simular_deploy(central, mock, out)
             rep.paso('6c. deploy_site.py --dry-run', 'ok',
                      f"{m.group(1) if m else '?'} fichero(s) a subir frente al FTP simulado (= main sin la tanda): "
                      + ', '.join(listed[:8]))
