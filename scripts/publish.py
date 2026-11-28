@@ -404,11 +404,18 @@ def latest_json(version, notes, pub_date, signature, url):
 # ───────────────────────────── novedades ─────────────────────────────
 
 NEWS_ANCHOR = '<div class="news-list">'
+# Diseño v2 de la web (2026-11-28): la lista es <div class="stack"> dentro de la sección
+# id="releases", y cada entrada un <div class="card"> en una sola línea.
+NEWS_V2_SECTION = 'id="releases"'
+NEWS_V2_ANCHOR = '<div class="stack">'
 
 
 def news_has(text, slug, version):
     for art in re.findall(r'<article class="news-item">(.*?)</article>', text, re.S):
         if f'href="/tools/{slug}/"' in art and f'<p class="version">Version {version}</p>' in art:
+            return True
+    for card in re.findall(r'<div class="card">(.*?)</div>', text, re.S):
+        if f'href="/tools/{slug}/"' in card and f'<p>Version {version}</p>' in card:
             return True
     return False
 
@@ -417,10 +424,19 @@ def news_insert(text, date, name, version, notes, slug):
     """Devuelve el HTML con la entrada nueva arriba del todo, o el mismo si ya estaba."""
     if news_has(text, slug, version):
         return text
-    nl = '\r\n' if '\r\n' in text else '\n'
     i = text.find(NEWS_ANCHOR)
     if i < 0:
-        raise Fallo('site/news/index.html sin <div class="news-list">')
+        sec = text.find(NEWS_V2_SECTION)
+        k = text.find(NEWS_V2_ANCHOR, sec) if sec >= 0 else -1
+        if k < 0:
+            raise Fallo('site/news/index.html sin <div class="news-list"> ni <div class="stack"> en id="releases"')
+        k += len(NEWS_V2_ANCHOR)
+        card = (f'<div class="card"><time datetime="{date}">{date}</time>'
+                f'<h3>{html.escape(name, quote=False)}</h3><p>Version {version}</p>'
+                f'<p>{html.escape(notes, quote=False)}</p>'
+                f'<a href="/tools/{slug}/">Tool page →</a></div>')
+        return text[:k] + card + text[k:]
+    nl = '\r\n' if '\r\n' in text else '\n'
     j = text.index('\n', i) + 1
     block = [
         '',

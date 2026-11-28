@@ -186,6 +186,24 @@ def test_news_insert_sin_ancla():
         publish.news_insert('<main></main>', '2026-11-10', 'X', '1.0.0', 'n', 'x')
 
 
+
+NEWS_V2 = ('<section class="hero"><div class="stack">hero</div></section>'
+           '<section class="sec band-w" id="releases"><h2>Release notes</h2><div class="stack">'
+           '<div class="card"><time datetime="2026-11-27">2026-11-27</time><h3>Old</h3><p>Version 1.0.0</p>'
+           '<p>old</p><a href="/tools/old/">Tool page →</a></div></div></section>')
+
+
+def test_news_insert_diseno_v2_arriba_en_releases_y_es_idempotente():
+    out = publish.news_insert(NEWS_V2, '2026-11-28', 'Vivid Butterfly', '1.1.0', 'New <icon>.', 'vivid-butterfly')
+    assert out.index('Version 1.1.0') < out.index('<p>old</p>')
+    assert out.index('id="releases"') < out.index('Version 1.1.0')
+    assert '<div class="stack">hero</div>' in out
+    assert ('<div class="card"><time datetime="2026-11-28">2026-11-28</time><h3>Vivid Butterfly</h3>'
+            '<p>Version 1.1.0</p><p>New &lt;icon&gt;.</p><a href="/tools/vivid-butterfly/">Tool page →</a></div>'
+            '<div class="card"><time datetime="2026-11-27">') in out
+    assert publish.news_insert(out, '2026-11-29', 'Vivid Butterfly', '1.1.0', 'x', 'vivid-butterfly') == out
+    assert publish.news_has(NEWS_V2, 'old', '1.0.0')
+
 # ── central ──
 
 CATALOG = '''const TOOLS = [
